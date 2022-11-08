@@ -37,6 +37,7 @@
 # inclusions
 import numpy as np
 import scipy
+from sklearn.manifold import MDS as skMDS
 from sklearn_extra.cluster import KMedoids
 from tqdm.notebook import tqdm, trange
 
@@ -94,7 +95,6 @@ def splitForestNode(currentData, successorData, ppcaModel={}, nDir=2, nLeaf=40, 
     # If this can't be split according to parameters, then return node!
     if D < 2*nLeaf:
         # If it has too few points to be split, and no PPCA model is provided, this function assumes it's a root node. But these are incompatible!
-        print(D)
         if rootNode:
             raise ValueError("Too few data points to split, but no PPCA model provided (it is a terminal and a root node)")
         # If it has too few points to be split, but has a PPCA model, then it is a terminal node. Return PPCA model, identify it as a terminal node, and stop.
@@ -104,7 +104,8 @@ def splitForestNode(currentData, successorData, ppcaModel={}, nDir=2, nLeaf=40, 
         node['terminalNode'] = True
         node['mean'] = ppcaModel['mean']
         node['covariance'] = ppcaModel['covariance']
-        node['invcov'] = ppcaModel['invcov']
+        node['invcov'] = np.linalg.inv(ppcaModel['covariance'])
+        node['logdetcov'] = 2*np.log(np.prod(np.diag(np.linalg.cholesky(ppcaModel['covariance']))))
         node['likelihood'] = ppcaModel['likelihood']
         return node
     
@@ -139,9 +140,10 @@ def optimizeHyperplane(currentData, successorData, nDir=2, nLeaf=40, nQuant=10):
         raise ValueError("optimizeHyperplane received data with too few datapoints to split!!")
     
     # Prepare splitting procedure (use quantile speedup trick for decision thresholds)
-    minQuant = (nLeaf+2)/D
-    maxQuant = 1 - minQuant
-    quantPoints = np.linspace(minQuant,maxQuant,nQuant-1)
+    quantPoints = np.linspace(0,1,nQuant+2)[1:-1]
+    if (D < 3*nLeaf) and (0.5 not in quantPoints): 
+        # make sure we include the middle in case a 50/50 split is the only way
+        quantPoints = np.concatenate((quantPoints,[0.5]))
     
     # Generate candidate hyperplane directions on unit hypersphere
     hypDirs = np.zeros((N,nDir)) # do it this way to avoid annoyance, it's very much not the bottleneck of the pipeline 
@@ -161,6 +163,9 @@ def optimizeHyperplane(currentData, successorData, nDir=2, nLeaf=40, nQuant=10):
             # Do isotropic gaussian model first
             idxLeft = np.where(cProjection <= cThreshold)[0]
             idxRight = np.where(cProjection > cThreshold)[0]
+            if len(idxLeft)<nLeaf or len(idxRight)<nLeaf:
+                ssError.append(np.inf)
+                continue
             cMeanLeft = np.mean(successorData[:,idxLeft],axis=1,keepdims=True)
             cMeanRight = np.mean(successorData[:,idxRight],axis=1,keepdims=True)
             cDevLeft = np.sum((successorData[:,idxLeft] - cMeanLeft)**2)
@@ -168,6 +173,7 @@ def optimizeHyperplane(currentData, successorData, nDir=2, nLeaf=40, nQuant=10):
             ssError.append(cDevLeft+cDevRight)
             if (len(idxLeft) < nLeaf) or (len(idxRight) < nLeaf):
                 print(f"Left: {len(idxLeft)}, Right: {len(idxRight)}")
+                print(f"Quantiles: {quantPoints}, quantPoints * numData: {quantPoints*D}")
                 raise ValueError("Quantization wrong in optimizeHyperplane, one leaf ended up with too few datapoints")
         
         # Then, for the best isotropic fit, compute a full ppca model
@@ -195,28 +201,35 @@ def optimizeHyperplane(currentData, successorData, nDir=2, nLeaf=40, nQuant=10):
     leftNode['mean'] = uCandidate[idxHyperplane,:,0]
     leftNode['covariance'] = covCandidate[idxHyperplane,:,:,0]
     leftNode['likelihood'] = llCandidate[idxHyperplane,0]
-    leftNode['invcov'] = np.linalg.inv(covCandidate[idxHyperplane,:,:,0])
     # Save right node parameters to dictionary
     rightNode = {}
     rightNode['mean'] = uCandidate[idxHyperplane,:,1]
     rightNode['covariance'] = covCandidate[idxHyperplane,:,:,1]
     rightNode['likelihood'] = llCandidate[idxHyperplane,1]
-    rightNode['invcov'] = np.linalg.inv(covCandidate[idxHyperplane,:,:,1])
     
-    print(f"Left length: {len(idxLeft)}, Right length: {len(idxRight)}")
     return hyperplane, leftNode, rightNode, currentData[:,idxLeft], successorData[:,idxLeft], currentData[:,idxRight], successorData[:,idxRight]
 
 
-def checkValidPPCA(node):
+def checkValidPPCA(node,withInverse=False):
     # Take in dictionary, check if it contains a valid PPCA model
-    # First check if keys exist
-    if ('mean' in node) and ('covariance' in node) and ('likelihood' in node):# and ('invcov' in node):
-        # Then check if they have the right dimensions 
-        if (node['mean'].ndim == 1) and (node['covariance'].ndim == 2) and (node['likelihood'].ndim==0): # and (node['invcov'].ndim==2) and (node['covariance'].shape == node['invcov'].shape):
-            # Then check if the shapes match
-            if node['mean'].shape[0] == node['covariance'].shape[0] == node['covariance'].shape[1]:
-                # Only then, return True
-                return True
+    if withInverse:
+        # First check if keys exist
+        if ('mean' in node) and ('covariance' in node) and ('likelihood' in node) and ('invcov' in node):
+            # Then check if they have the right dimensions 
+            if (node['mean'].ndim == 1) and (node['covariance'].ndim == 2) and (node['likelihood'].ndim==0) and (node['invcov'].ndim==2) and (node['covariance'].shape == node['invcov'].shape):
+                # Then check if the shapes match
+                if node['mean'].shape[0] == node['covariance'].shape[0] == node['covariance'].shape[1] == node['invcov'].shape[0] == node['invcov'].shape[1]:
+                    # Only then, return True
+                    return True
+    else: 
+        # First check if keys exist
+        if ('mean' in node) and ('covariance' in node) and ('likelihood' in node):
+            # Then check if they have the right dimensions 
+            if (node['mean'].ndim == 1) and (node['covariance'].ndim == 2) and (node['likelihood'].ndim==0):
+                # Then check if the shapes match
+                if node['mean'].shape[0] == node['covariance'].shape[0] == node['covariance'].shape[1]:
+                    # Only then, return True
+                    return True
     # Otherwise, this isn't a valid PPCA model
     return False
 
@@ -236,6 +249,7 @@ def summarizeForest(forest, removeOriginal=False):
     forest['ppcaMeans'] = []
     forest['ppcaCovs'] = []
     forest['ppcaInvCovs'] = []
+    forest['ppcaLogDets'] = []
     
     for tt, tree in enumerate(forest['tree']):
         treeStructure = returnTreeStructure(tree) # Measure tree structure (all possible paths to terminal nodes)
@@ -243,18 +257,21 @@ def summarizeForest(forest, removeOriginal=False):
         cPpcaMeans = np.zeros((forest['nDims'],numPaths))
         cPpcaCovs = np.zeros((forest['nDims'],forest['nDims'],numPaths))
         cPpcaInvCovs = np.zeros((forest['nDims'],forest['nDims'],numPaths))
+        cPpcaLogDets = np.zeros(numPaths)
         for pp in range(numPaths):
             cPathKeys = returnDecPath(treeStructure[pp]) # For each path, create a list of strings describing path
             updateNestedTree(tree, cPathKeys, 'pathIdx', pp) # Add a pathIdx value corresponding to this path
             cPpcaMeans[:,pp] = returnNestedTree(tree, cPathKeys, 'mean') # Return the mean, covariance, and inverse covariance for this path along the tree
             cPpcaCovs[:,:,pp] = returnNestedTree(tree, cPathKeys, 'covariance')
-            cPpcaInvCovs[:,:,pp] = returnNestedTree(tree, cPathKeys, 'invcovariance')
+            cPpcaInvCovs[:,:,pp] = returnNestedTree(tree, cPathKeys, 'invcov')
+            cPpcaLogDets[pp] = returnNestedTree(tree, cPathKeys, 'logdetcov')
             
         # Add ppca model for each path to the top of the forest, along with the tree structure
         forest['treeSummary'].append(treeStructure)
         forest['ppcaMeans'].append(cPpcaMeans)
         forest['ppcaCovs'].append(cPpcaCovs)
         forest['ppcaInvCovs'].append(cPpcaInvCovs)
+        forest['ppcaLogDets'].append(cPpcaLogDets)
 
 def returnTreeStructure(tree):
     # Returns tree structure - in form of list of lists, indicating all possible paths within tree
@@ -330,6 +347,14 @@ def returnNestedTree(tree, decPath, key):
 # ----------------------------------------------
 # function library: measure probability with forest (using summarized trees!!!)
 # ----------------------------------------------
+def probabilityToDistance(probVector,minCutoff=0):
+    # Convert probability to distance (with dist = sqrt(-log(p)))
+    # But avoiding nonsensical computation on p=0 (set this distance to infinity)
+    distVector = np.where(probVector > minCutoff, probVector, np.inf)
+    np.log(distVector, out=distVector, where=distVector<np.inf)
+    np.sqrt(-distVector, out=distVector, where=distVector<np.inf)
+    return np.abs(distVector)
+    
 def smartGridProbability(data1, forest, data2=None):
     # Compute probability of transition from each point in data1 to each point in data2 using PPCA models in forest
     # If data2 is None, compute probability of transitioning between each pair in data1 
@@ -343,10 +368,41 @@ def smartGridProbability(data1, forest, data2=None):
     
     numTrees = forest['numTrees']
     probability = -1*np.ones((N1,N2,numTrees))
-    return None
+    progressBar = tqdm(range(numTrees))
+    for tt in progressBar:
+        progressBar.set_description(f"Measuring probability in tree {tt+1}/{numTrees} -- comparing {N1} points to {N2} points.")
+        tPathIdx = returnPathIndexLoop(data1, forest['tree'][tt])
+        tPpcaMean = forest['ppcaMeans'][tt][:,tPathIdx]
+        tPpcaInvCov = forest['ppcaInvCovs'][tt][:,:,tPathIdx]
+        tPpcaLogDet = forest['ppcaLogDets'][tt][tPathIdx]
+        for n1 in range(N1):
+            for n2 in range(N2):
+                probability[n1,n2,tt] = smartLikelihood(data2[:,n2],tPpcaMean[:,n1],tPpcaInvCov[:,:,n1],tPpcaLogDet[n1],D1)                
+    return np.median(probability,axis=2)
+    
+def smartForestLikelihood(cdata, sdata, forest):
+    N = cdata.shape[1]
+    D = forest['nDims']
+    T = forest['numTrees']
+    probability = np.empty((N,T))
+    for tt in range(T):
+        # For each tree, start by returning path index of each datapoint
+        tPathIdx = returnPathIndexLoop(cdata, forest['tree'][tt])
+        probability[:,tt] = smartTreeLikelihood(sdata, forest['ppcaMeans'][tt][:,tPathIdx], forest['ppcaInvCovs'][tt][:,:,tPathIdx], forest['ppcaLogDets'][tt][tPathIdx], D)
+    
+    return np.median(probability,axis=1)
 
-def smartProbability(cdata, sdata, tree):
-    return None
+def smartTreeLikelihood(data, ppcaMean, ppcaInvCov, ppcaLogDet, D):
+    probability = np.empty(data.shape[1])
+    for dd in range(data.shape[1]):
+        probability[dd] = smartLikelihood(data[:,dd],ppcaMean[:,dd],ppcaInvCov[:,:,dd],ppcaLogDet[dd],D)
+    return probability
+
+def smartLikelihood(data, u, iS, logDet, D): 
+    udata = data - u
+    expArgument = -(1/2) * (udata.reshape(1,-1) @ iS @ udata.reshape(-1,1))
+    logLikelihood = -D/2*np.log(2*np.pi) - 1/2*logDet + expArgument
+    return np.exp(logLikelihood)
 
 def returnPathIndexLoop(cdata, tree):
     ND = cdata.shape[1]
@@ -367,6 +423,116 @@ def returnPathIndex(cdata, tree):
         if not "pathIdx" in tree:
             raise ValueError("TerminalNode found, but didn't contain an index to this tree path. Summarize tree first!")
         return tree['pathIdx']
+
+# --------------------------------------------
+# function library: multidimensional scaling
+# --------------------------------------------
+def initMDS(distmat,dims,method='metric'):
+    
+    if method=='fast':
+        # Create double-centered squared distance matrix
+        N = distmat.shape[0]
+        D2 = distmat**2
+        C = np.identity(N) - (1/N)*np.ones((N,N))
+        B = (-1/2) * (C @ D2 @ C)
+
+        # Do eigendecomposition on B
+        w,v = scipy.linalg.eigh(B)
+        idx = np.argsort(-w) # return index of descending sort
+        w = w[idx[:dims]] # sort eigenvalues, only keep requested ones
+        v = v[:,idx[:dims]] # sort eigenvectors, only keep requested ones
+        return v @ np.diag(np.sqrt(w))
+
+    elif method=='metric':
+        # Return cMDS solution
+        mdsEmbedding = skMDS(n_components=dims, dissimilarity='precomputed')
+        return mdsEmbedding.fit_transform(distmat)
+    
+    else:
+        raise ValueError("Didn't recognize method")
+        
+
+# --------------------------------------------
+# function library: ppca model
+# --------------------------------------------
+def ppca(data, minVariance=0.95):
+    # probabilistic ppca - using description in Methods Section 1.7 of the following: https://www.biorxiv.org/content/10.1101/418939v2.full.pdf
+    # data is a (observations x dimensions) array 
+    # minVariance defines minimum fraction of variance required for fitting the PPCA model
+    
+    if data.ndim != 2:
+        raise ValueError("data must be a matrix")
+    
+    # Return ML estimate of mean
+    uML = np.mean(data,axis=0)
+    cdata = data - uML # use centered data for computations
+    
+    # Pick method based on computational speed (logic inherited from Low/Lewallen, haven't tested yet!)
+    N,D = data.shape
+    if N > D:
+        # do eigendecomposition
+        covData = np.cov(cdata.T, bias=True)
+        w,v = scipy.linalg.eigh(covData)
+        w[w<=np.finfo(float).eps]=np.finfo(float).eps # don't allow weird tiny numbers (or negatives, it's a symmetric positive semidefinite matrix)
+        idx = np.argsort(-w) # return index of descending sort
+        w = w[idx] # sort eigenvalues
+        v = v[:,idx] # sort eigenvectors
+        s = np.sqrt(N*w) # singular values
+        
+    else:
+        # do svd instead
+        _,s,v = np.linalg.svd(cdata)
+        v = v.T
+        w = s**2 / N # eigenvalues
+    
+    varExplained = np.cumsum(w / np.sum(w))
+    q = int(np.where(varExplained >= minVariance)[0][0])
+    
+    # Return ML estimate of noise variance
+    nvML = np.mean(w[q:]) 
+    
+    # Keep q eigenvalues & eigenvectors
+    w = w[:q]
+    v = v[:,:q]
+    
+    # Compute ML estimate of covariance
+    covML = nvML*np.identity(D) + (v @ (np.diag(w) - nvML*np.identity(q)) @ v.T)
+    invCovML = np.linalg.inv(covML)
+    
+    # Return likelihood
+    smartLogDet = 2*np.log(np.prod(np.diag(np.linalg.cholesky(covML))))
+    likelihood = -N*D/2*np.log(2*np.pi) - N/2*smartLogDet - (1/2)*np.sum(np.array([cdata[n,:] @ invCovML @ cdata[n,:].T for n in range(N)]))
+
+    return likelihood,uML,covML,nvML,w,v
+
+
+# --------------------------------------------
+# function library: data management
+# --------------------------------------------
+def returnLandmarkPoints(data, numLandmark=2000, numSeed=10, algorithm='greedy'):
+    # Can easily speed this up with Numba
+    # -- All I need to do is vectorize the minimum computation across jj's.... 
+    
+    # K-Medioids Algorithm (takes too long for big datasets!)
+    if algorithm=='kmedioids':
+        kmedoids = KMedoids(n_clusters=numLandmark).fit(data.T)
+        return kmedoids.cluster_centers_.T, kmedoids.medoid_indices_
+    
+    # Greedy algorithm: http://graphics.stanford.edu/courses/cs468-05-winter/Papers/Landmarks/Silva_landmarks5.pdf
+    if algorithm=='greedy':
+        N = data.shape[1]
+        l = np.zeros(numLandmark,dtype=int)
+        l[:numSeed] = np.random.choice(N,numSeed,replace=False)
+        m = np.min(scipy.spatial.distance.cdist(data[:,l[:numSeed]].T,data.T,metric='Euclidean'),axis=0)
+
+        for ii in range(numSeed,numLandmark):
+            # Set next landmark to datapoint furthest from other datapoints
+            l[ii] = np.argmax(m)
+            m = np.minimum(m, np.sum((data[:,l[ii]].reshape(-1,1) - data)**2,axis=0))
+        return data[:,l],l
+
+    raise ValueError("algorithm didn't match any of the available options...")
+
     
     
 # ----------------------------------------------
@@ -450,12 +616,11 @@ def computeProbability(cdata,sdata,tree,method='log'):
         # Otherwise, confirm we have a PPCA model and return probability
         if not checkValidPPCA(tree):
             raise ValueError("TerminalNode found, but didn't have a valid PPCA model")
-        return likelihood(sdata, tree['mean'], tree['covariance'], method=method) # add tree['invcov'],  back
+        return likelihood(sdata, tree['mean'], tree['covariance'], tree['invcov'], method=method)
 
-def likelihood(data, u, S, method='log'): # add iS back to this 
+def likelihood(data, u, S, iS, method='log'): # add iS back to this 
     D = data.shape[0]
     udata = data - u
-    iS = np.linalg.inv(S)
     expArgument = -(1/2) * (udata.T @ iS @ udata)
     if method=='log':
         # Measure log likelihood first
@@ -471,96 +636,6 @@ def likelihood(data, u, S, method='log'): # add iS back to this
     return likelihood
 
 
-# --------------------------------------------
-# function library: ppca model
-# --------------------------------------------
-def ppca(data, minVariance=0.95):
-    # probabilistic ppca - using description in Methods Section 1.7 of the following: https://www.biorxiv.org/content/10.1101/418939v2.full.pdf
-    # data is a (observations x dimensions) array 
-    # minVariance defines minimum fraction of variance required for fitting the PPCA model
-    
-    if data.ndim != 2:
-        raise ValueError("data must be a matrix")
-    
-    # Return ML estimate of mean
-    uML = np.mean(data,axis=0)
-    cdata = data - uML # use centered data for computations
-    
-    # Pick method based on computational speed (logic inherited from Low/Lewallen, haven't tested yet!)
-    N,D = data.shape
-    if N > D:
-        # do eigendecomposition
-        covData = np.cov(cdata.T, bias=True)
-        w,v = scipy.linalg.eigh(covData)
-        w[w<=np.finfo(float).eps]=np.finfo(float).eps # don't allow weird tiny numbers (or negatives, it's a symmetric positive semidefinite matrix)
-        idx = np.argsort(-w) # return index of descending sort
-        w = w[idx] # sort eigenvalues
-        v = v[:,idx] # sort eigenvectors
-        s = np.sqrt(N*w) # singular values
-        
-    else:
-        # do svd instead
-        _,s,v = np.linalg.svd(cdata)
-        v = v.T
-        w = s**2 / N # eigenvalues
-    
-    varExplained = np.cumsum(w / np.sum(w))
-    q = int(np.where(varExplained >= minVariance)[0][0])
-    
-    # Return ML estimate of noise variance
-    nvML = np.mean(w[q:]) 
-    
-    # Keep q eigenvalues & eigenvectors
-    w = w[:q]
-    v = v[:,:q]
-    
-    # Compute ML estimate of covariance
-    covML = nvML*np.identity(D) + (v @ (np.diag(w) - nvML*np.identity(q)) @ v.T)
-    invCovML = np.linalg.inv(covML)
-    
-    # Return likelihood
-    smartLogDet = 2*np.log(np.prod(np.diag(np.linalg.cholesky(covML))))
-    likelihood = -N*D/2*np.log(2*np.pi) - N/2*smartLogDet - (1/2)*np.sum(np.array([cdata[n,:] @ invCovML @ cdata[n,:].T for n in range(N)]))
-
-    return likelihood,uML,covML,nvML,w,v
-
-
-# --------------------------------------------
-# function library: data management
-# --------------------------------------------
-def returnLandmarkPoints(data, numLandmark=2000, numSeed=10, algorithm='greedy'):
-    # Can easily speed this up with Numba
-    # -- All I need to do is vectorize the minimum computation across jj's.... 
-    
-    # K-Medioids Algorithm (takes too long for big datasets!)
-    if algorithm=='kmedioids':
-        kmedoids = KMedoids(n_clusters=numLandmark).fit(data.T)
-        return kmedoids.cluster_centers_.T, kmedoids.medoid_indices_
-    
-    # Greedy algorithm: http://graphics.stanford.edu/courses/cs468-05-winter/Papers/Landmarks/Silva_landmarks5.pdf
-    if algorithm=='greedy':
-        N = data.shape[1]
-        l = np.zeros(numLandmark,dtype=int)
-        l[:numSeed] = np.random.choice(N,numSeed,replace=False)
-        m = np.zeros(N)
-        for jj in range(N):
-            # Determine how close each datapoint is to randomly selected seed points
-            m[jj] = np.min(np.sum((data[:,l[:numSeed]] - data[:,jj].reshape(-1,1))**2),axis=0)
-        
-        progressBar = tqdm(range(numSeed,numLandmark))
-        for ii in progressBar:
-            progressBar.set_description(f"Selecting {ii+1}'th/{numLandmark} landmark point")
-            # Set next landmark to datapoint furthest from other datapoints
-            l[ii] = np.argmax(m)
-            for jj in range(N):
-                # Then reset distances to minimum distance if it is closer to recently selected landmark
-                m[jj] = np.minimum(m[jj], np.sum((data[:,l[ii]] - data[:,jj])**2))
-        return data[:,l],l
-
-    raise ValueError("algorithm didn't match any of the available options...")
-
-    
-    
 # --------------------------------------------
 # function library: debugging type functions (not efficient, but useful for checking the algorithm after running it) 
 # --------------------------------------------
@@ -592,7 +667,7 @@ def splitForestNodeWithSummary(currentData, successorData, ppcaModel={}, nDir=2,
         node['terminalNode'] = True
         node['mean'] = ppcaModel['mean']
         node['covariance'] = ppcaModel['covariance']
-        node['invcov'] = ppcaModel['invcov']
+        node['invcov'] = np.linalg.inv(ppcaModel['covariance'])
         node['likelihood'] = ppcaModel['likelihood']
         return node
     
@@ -694,13 +769,11 @@ def optimizeHyperplaneWithSummary(currentData, successorData, nDir=2, nLeaf=40, 
     leftNode['mean'] = uCandidate[idxHyperplane,:,0]
     leftNode['covariance'] = covCandidate[idxHyperplane,:,:,0]
     leftNode['likelihood'] = llCandidate[idxHyperplane,0]
-    leftNode['invcov'] = np.linalg.inv(covCandidate[idxHyperplane,:,:,0])
     # Save right node parameters to dictionary
     rightNode = {}
     rightNode['mean'] = uCandidate[idxHyperplane,:,1]
     rightNode['covariance'] = covCandidate[idxHyperplane,:,:,1]
     rightNode['likelihood'] = llCandidate[idxHyperplane,1]
-    rightNode['invcov'] = np.linalg.inv(covCandidate[idxHyperplane,:,:,1])
     
     
     # -- just added index !!! --
