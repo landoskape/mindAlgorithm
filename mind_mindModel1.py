@@ -32,9 +32,9 @@ class mindModel:
         self.opts['rf_method'] = 'minVariance' # which method to use for PPCA models in random forest (either 'minVariance' or 'numComponents')
         self.opts['rf_dimPrm'] = 0.95 # desired fraction of variance to explain with PPCA models (or number of components to keep)
         # Options for landmark points
-        self.opts['lmNumPoints'] = 2000 # number of landmark points to create
-        self.opts['lmNumSeed'] = 1 # number of landmark seeds to initiate algorithm with
-        self.opts['lmAlgorithm'] = 'greedy' # algorithm (can be 'greedy' or 'kmedoids'), k-medoids takes far too long and is unnecessary
+        self.opts['scaffoldPoints'] = 2000 # number of landmark points to create
+        self.opts['scaffoldSeeds'] = 1 # number of landmark seeds to initiate algorithm with
+        self.opts['scaffoldAlgorithm'] = 'greedy' # algorithm (can be 'greedy' or 'kmedoids'), k-medoids takes far too long and is unnecessary
         # Options for MDS
         self.opts['mdsSammonIterations'] = 800 # until this is coded with conjugate gradient descent, just use # of landmark points...
         self.opts['mdsSammonAlpha'] = 0.5
@@ -68,12 +68,13 @@ class mindModel:
         self.ppcaCovs = []
         self.ppcaInvCovs = []
         self.ppcaLogDets = []
-        # landmark variables
-        self.scaffoldPoints = self.opts['lmNumPoints']
-        self.scaffoldSeeds = self.opts['lmNumSeed']
-        self.scaffoldAlgorithm = self.opts['lmAlgorithm']
+        # scaffold variables
+        self.scaffoldPoints = self.opts['scaffoldPoints']
+        self.scaffoldSeeds = self.opts['scaffoldSeeds']
+        self.scaffoldAlgorithm = self.opts['scaffoldAlgorithm']
         self.scafIdx = []
         self.scafData = []
+        self.scafManifold = [] # coordinates of data in manifold space
         self.scafGridProb = []
         self.scafTrProb = []
         self.scafLocalDist = []
@@ -81,16 +82,19 @@ class mindModel:
         self.scafDist = [] # symmetric distance b/w landmark points        
         
         # MDS variables
-        self.mdsCoords = []
         self.mdsSammonIterations = self.opts['mdsSammonIterations']
         self.mdsSammonAlpha = self.opts['mdsSammonAlpha']
         
         # Forward/Reverse Mapping Variables
-        self.kFor = []
-        self.lamFor = []
-        self.kBack = []
-        self.lamBack = []
-    
+        self.mappingForwardOptDim = []
+        self.mappingBackwardOptDim = []
+        self.mappingForwardK = []
+        self.mappingForwardLambda = []
+        self.mappingBackwardK = []
+        self.mappingBackwardLambda = []
+        self.mappingOptionsK = np.arange(2,21)
+        self.mappingOptionsLambda = np.logspace(-6,1,30)
+        
     def addData(self, data):
         self.data = data
         self.numObs,self.numDims = data.shape
@@ -378,13 +382,21 @@ class mindModel:
         assert np.allclose(np.sum(self.scafTrProb,axis=1),1), "sum(trProb,axis=1) does not all equal(close-to) 1!"
         self.scafLocalDist = probabilityToDistance(self.scafTrProb)
         self.scafGlobalDist = scipy.sparse.csgraph.johnson(self.scafLocalDist)
+        sgdMinimum = np.minimum(self.scafGlobalDist, self.scafGlobalDist.T)
+        sgdInfinite = np.logical_or(self.scafGlobalDist==np.inf, self.scafGlobalDist.T==np.inf)
         self.scafDist = (self.scafGlobalDist + self.scafGlobalDist.T)/2
-        assert np.all(self.scafDist >= 0), "Some of the landmark distances are negative. This probably means that smartGridProbability() is broken."
+        self.scafDist[sgdInfinite] = sgdMinimum[sgdInfinite]
+        assert np.all(self.scafDist >= 0), "Some of the scaffold distances are negative. This probably means that smartGridProbability() is broken."
+        assert np.all(self.scafDist != np.inf), "Some of the scaffold distance are infinite. This means that Johnson's algorithm couldn't find a path between at least 1 pair of points in either direction."
         
     # ------------------------------
     # -- multidimensional scaling --
     # ------------------------------
-    def performMDS(self, dims, returnmds=False):
+    def performMDS(self, dims, updateObject=True, returnCoord=False):
+        if (updateObject==False) and (returnCoord==False):
+            print("Either updateObject or returnCoord must be set to True. Exiting function.")
+            return 
+        
         # Start by initializing MDS coordinates with the closed from eigendecomposition solution 
         D2 = self.scafDist**2
         C = np.identity(self.scaffoldPoints) - (1/self.scaffoldPoints)*np.ones((self.scaffoldPoints,self.scaffoldPoints))
@@ -397,8 +409,8 @@ class mindModel:
         v = v[:,idx[:dims]] # sort eigenvectors, only keep requested ones
         
         # Initial MDS Coordinates:
-        self.mdsCoord = v @ np.diag(np.sqrt(w))
-        if dims==1: self.mdsCoord = self.mdsCoord.reshape(-1,1)
+        mdsCoord = v @ np.diag(np.sqrt(w))
+        if dims==1: mdsCoord = mdsCoord.reshape(-1,1)
         
         # Use sammon mapping to refine MDS coordinates
         self.error = -1*np.ones(self.mdsSammonIterations)
@@ -410,32 +422,57 @@ class mindModel:
         for it in progressBar:
             progressBar.set_description(f"Performing sammon mapping: Iteration {it+1}/{self.mdsSammonIterations}")
             
-            cdistvec = pdist(self.mdsCoord)
+            cdistvec = pdist(mdsCoord)
             cdistmat = squareform(cdistvec)
             
-            gradient = getGradient(self.scafDist, cdistmat, self.mdsCoord, errorConstant)
-            dblgrad = getDoubleGradient(self.scafDist, cdistmat, self.mdsCoord, errorConstant)
-            self.mdsCoord = self.mdsCoord - self.mdsSammonAlpha * gradient / np.linalg.norm(dblgrad)
-            cdistvec = pdist(self.mdsCoord)
+            gradient = getGradient(self.scafDist, cdistmat, mdsCoord, errorConstant)
+            dblgrad = getDoubleGradient(self.scafDist, cdistmat, mdsCoord, errorConstant)
+            mdsCoord = mdsCoord - self.mdsSammonAlpha * gradient / np.linalg.norm(dblgrad)
+            cdistvec = pdist(mdsCoord)
             self.error[it] = sammonError(distvec, cdistvec)        
         
-        assert self.mdsCoord.ndim==2, "mdsCoord.ndim != 2" # This just for debugging the case where dims==1
+        assert mdsCoord.ndim==2, "mdsCoord.ndim != 2" # This just for debugging the case where dims==1
         
         # Center coordinates
         if dims>1:
-            v = mppca.ppcaFull(self.mdsCoord, method='numComponents', dimPrm=dims)[0] # return all eigenvectors
-            self.mdsCoord = (self.mdsCoord - np.mean(self.mdsCoord,axis=0)) @ v
+            v = mppca.ppcaFull(mdsCoord, method='numComponents', dimPrm=dims)[0] # return all eigenvectors
+            mdsCoord = (mdsCoord - np.mean(mdsCoord,axis=0)) @ v
         else:
-            self.mdsCoord = self.mdsCoord - np.mean(self.mdsCoord)
+            mdsCoord = mdsCoord - np.mean(mdsCoord)
             
-        # Return centered & optimized coordinates for comparison if it is explicitly requested
-        if returnmds: return self.mdsCoord
+        if updateObject: self.scafManifold = mdsCoord # if requested, save coordinates 
+        if returnCoord: return mdsCoord # if requested, return output
     
-
-    # --------------------------------------------
+    # ---------------------------------------------
     # function library: forward and reverse mapping
-    # --------------------------------------------
-    def mapping(data, scaffold, target, k, lam):
+    # ---------------------------------------------
+    def forwardMapping(self, data):
+        if self.scafManifold is None:
+            raise ValueError("Forward mapping can only be used if the scaffold is already mapped to a manifold. Use performMDS with updateObject=True to do so.")
+        if self.mappingForwardK is None:
+            raise ValueError("Forward mapping can only be used if the forward k parameter has been set. Use optimizeForwardMapping to do so (or provide it manually).")
+        if self.mappingForwardLambda is None:
+            raise ValueError("Forward mapping can only be used if the forward lambda parameter has been set. Use optimizeForwardMapping to do so (or provide it manually).")
+        if self.mappingForwardOptDim != self.scafManifold.shape[1]:
+            print("Alert: forward mapping parameters optimized for different manifold dimensionality!")
+        if data.ndim==1: data=data.reshape(1,-1)
+        assert data.shape[1]==self.drDims, "for forward mapping, data must have same dimensions as scaffold points (same as ppca models of data)"
+        return self.mapping(data, self.scafData, self.scafManifold, self.mappingForwardK, self.mappingForwardLambda)
+    
+    def backwardMapping(self, data):
+        if self.scafManifold is None:
+            raise ValueError("Backward mapping can only be used if the scaffold is already mapped to a manifold. Use performMDS with updateObject=True to do so.")
+        if self.mappingForwardK is None:
+            raise ValueError("Backward mapping can only be used if the backward k parameter has been set. Use optimizeBackwardMapping to do so (or provide it manually).")
+        if self.mappingForwardLambda is None:
+            raise ValueError("Backward mapping can only be used if the backward lambda parameter has been set. Use optimizeBackwardMapping to do so (or provide it manually).") 
+        if self.mappingBackwardOptDim != self.scafManifold.shape[1]:
+            print("Alert: backward mapping parameters optimized for different manifold dimensionality!")
+        if data.ndim==1: data=data.reshape(1,-1)
+        assert data.shape[1]==self.scafManifold.shape[1], "for backward mapping, data must have same dimensions as most recently set MDS coordinates of the scaffold points" 
+        return self.mapping(data, self.scafManifold, self.scafData, self.mappingBackwardK, self.mappingBackwardLambda)
+        
+    def mapping(self, data, scaffold, target, k, lam):
         # data is an N x D1 array of datapoints to acquire weights for
         # scaffold is an M x D1 array of scaffold points to approximate with
         # target is an M x D2 array of target points associated with each scaffold point on a different manifold
@@ -453,17 +490,58 @@ class mindModel:
             datamap[nd,:] = np.dot(cw,target[idx[nd,:],:])
         return datamap
 
-    @nb.njit(fastmath=True)
-    def mapWeights(gvec, k, lam):
-        gmat = gvec @ gvec.T
-        w = np.linalg.inv(gmat + lam*np.identity(k)) @ np.ones(k)
-        w = w / np.sum(w)
-        return w
-    
-    
-    
-    
-    
+    def optimizeForwardMapping(self, numIterations=5, frac2test=0.1, kOptions=None, lamOptions=None):
+        # optimize forward mapping using euclidean distance between scaffoldData and scaffoldManifold
+        # can choose how many iterations to do, what fraction of scaffold points to test, and the options for k and lambda
+        if kOptions is None: kOptions = self.mappingOptionsK
+        if lamOptions is None: lamOptions = self.mappingOptionsLambda
+        NK = len(kOptions)
+        NL = len(lamOptions)
+        netError = np.zeros((numIterations,NK,NL))
+        numTest = int(self.scaffoldPoints * frac2test)
+        for it in range(numIterations):
+            idxMap = np.random.choice(self.scaffoldPoints, numTest, replace=False)
+            idxScaf = np.delete(np.arange(self.scaffoldPoints), idxMap)
+            for ki in range(NK):
+                for li in range(NL):
+                    testMap = self.mapping(self.scafData[idxMap,:], self.scafData[idxScaf,:], self.scafManifold[idxScaf,:], kOptions[ki], lamOptions[li])
+                    netError[it,ki,li] = np.sqrt(np.sum((self.scafManifold[idxMap,:] - testMap)**2))
+        totalError = np.mean(netError,axis=0)
+        idxBest = np.unravel_index(np.argmin(totalError),totalError.shape)
+        if idxBest[0]==0: print("Alert: best k in optimizeForwardMapping was an edge case (the smallest option). Consider expanding search.")
+        if idxBest[0]==NK-1: print("Alert: best k in optimizeForwardMapping was an edge case (the largest option). Consider expanding search.")
+        if idxBest[1]==0: print("Alert: best lambda in optimizeForwardMapping was an edge case (the smallest option). Consider expanding search.")
+        if idxBest[1]==NL-1: print("Alert: best lambda in optimizeForwardMapping was an edge case (the largest option). Consider expanding search.")
+        self.mappingForwardK = kOptions[idxBest[0]]
+        self.mappingForwardLambda = lamOptions[idxBest[1]]
+        self.mappingForwardOptDim = self.scafManifold.shape[1]
+        
+    def optimizeBackwardMapping(self, numIterations=5, frac2test=0.1, kOptions=None, lamOptions=None):
+        # optimize backward mapping using euclidean distance between scaffoldData and scaffoldManifold
+        # can choose how many iterations to do, what fraction of scaffold points to test, and the options for k and lambda
+        if kOptions is None: kOptions = self.mappingOptionsK
+        if lamOptions is None: lamOptions = self.mappingOptionsLambda
+        NK = len(kOptions)
+        NL = len(lamOptions)
+        netError = np.zeros((numIterations,NK,NL))
+        numTest = int(self.scaffoldPoints * frac2test)
+        for it in range(numIterations):
+            idxMap = np.random.choice(self.scaffoldPoints, numTest, replace=False)
+            idxScaf = np.delete(np.arange(self.scaffoldPoints), idxMap)
+            for ki in range(NK):
+                for li in range(NL):
+                    testMap = self.mapping(self.scafManifold[idxMap,:], self.scafManifold[idxScaf,:], self.scafData[idxScaf,:], kOptions[ki], lamOptions[li])
+                    netError[it,ki,li] = np.sqrt(np.sum((self.scafData[idxMap,:] - testMap)**2))
+        totalError = np.mean(netError,axis=0)
+        idxBest = np.unravel_index(np.argmin(totalError),totalError.shape)
+        if idxBest[0]==0: print("Alert: best k in optimizeBackwardMapping was an edge case (the smallest option). Consider expanding search.")
+        if idxBest[0]==NK-1: print("Alert: best k in optimizeBackwardMapping was an edge case (the largest option). Consider expanding search.")
+        if idxBest[1]==0: print("Alert: best lambda in optimizeBackwardMapping was an edge case (the smallest option). Consider expanding search.")
+        if idxBest[1]==NL-1: print("Alert: best lambda in optimizeBackwardMapping was an edge case (the largest option). Consider expanding search.")
+        self.mappingBackwardK = kOptions[idxBest[0]]
+        self.mappingBackwardLambda = lamOptions[idxBest[1]]
+        self.mappingBackwardOptDim = self.scafManifold.shape[1]
+        
     # -----------------------
     # -- forest processing --
     # -----------------------
@@ -582,6 +660,13 @@ def getDoubleGradient(distmat, cdistmat, coord, errorConstant):
 @nb.njit(nb.float64(nb.float64[:],nb.float64[:]), nogil=True, parallel=True)
 def sammonError(distvec, cdistvec):
     return np.sum((distvec - cdistvec)**2/distvec) / np.sum(distvec)
+
+@nb.njit(fastmath=True)
+def mapWeights(gvec, k, lam):
+    gmat = gvec @ gvec.T
+    w = np.linalg.inv(gmat + lam*np.identity(k)) @ np.ones(k)
+    w = w / np.sum(w)
+    return w
 
 
 
