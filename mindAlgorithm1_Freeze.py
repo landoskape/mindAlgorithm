@@ -36,7 +36,9 @@
 
 # inclusions
 import numpy as np
+import numba as nb
 import scipy
+from scipy.spatial.distance import squareform, pdist, cdist
 from sklearn.manifold import MDS as skMDS
 from sklearn_extra.cluster import KMedoids
 from tqdm.notebook import tqdm, trange
@@ -254,16 +256,16 @@ def summarizeForest(forest, removeOriginal=False):
     for tt, tree in enumerate(forest['tree']):
         treeStructure = returnTreeStructure(tree) # Measure tree structure (all possible paths to terminal nodes)
         numPaths = len(treeStructure) 
-        cPpcaMeans = np.zeros((forest['nDims'],numPaths))
-        cPpcaCovs = np.zeros((forest['nDims'],forest['nDims'],numPaths))
-        cPpcaInvCovs = np.zeros((forest['nDims'],forest['nDims'],numPaths))
+        cPpcaMeans = np.zeros((numPaths,forest['nDims']))
+        cPpcaCovs = np.zeros((numPaths,forest['nDims'],forest['nDims']))
+        cPpcaInvCovs = np.zeros((numPaths,forest['nDims'],forest['nDims']))
         cPpcaLogDets = np.zeros(numPaths)
         for pp in range(numPaths):
             cPathKeys = returnDecPath(treeStructure[pp]) # For each path, create a list of strings describing path
             updateNestedTree(tree, cPathKeys, 'pathIdx', pp) # Add a pathIdx value corresponding to this path
-            cPpcaMeans[:,pp] = returnNestedTree(tree, cPathKeys, 'mean') # Return the mean, covariance, and inverse covariance for this path along the tree
-            cPpcaCovs[:,:,pp] = returnNestedTree(tree, cPathKeys, 'covariance')
-            cPpcaInvCovs[:,:,pp] = returnNestedTree(tree, cPathKeys, 'invcov')
+            cPpcaMeans[pp,:] = returnNestedTree(tree, cPathKeys, 'mean') # Return the mean, covariance, and inverse covariance for this path along the tree
+            cPpcaCovs[pp,:,:] = returnNestedTree(tree, cPathKeys, 'covariance')
+            cPpcaInvCovs[pp,:,:] = returnNestedTree(tree, cPathKeys, 'invcov')
             cPpcaLogDets[pp] = returnNestedTree(tree, cPathKeys, 'logdetcov')
             
         # Add ppca model for each path to the top of the forest, along with the tree structure
@@ -328,81 +330,10 @@ def returnTreeStructure(tree):
         treeStructure.append(cTreePath)
     return treeStructure
 
+
 def returnDecPath(decValues):
     decPath = [{0:'left', 1:'right'}[cdecision] for cdecision in decValues]
     return decPath
-    
-def updateNestedTree(tree, decPath, key, value):
-    # used to dynamically set value of nested dictionary (here, tree=dictioanry, decPath=list of keys,key=final key, value=value to change or set)
-    for dec in decPath:
-        tree = tree.setdefault(dec)
-    tree[key] = value
-    
-def returnNestedTree(tree, decPath, key):
-    # used to dynamically return value of nested dictionary (here, tree=dictioanry, decPath=list of keys, key=final key)
-    for dec in decPath:
-        tree = tree.setdefault(dec)
-    return tree.setdefault(key)
-
-# ----------------------------------------------
-# function library: measure probability with forest (using summarized trees!!!)
-# ----------------------------------------------
-def probabilityToDistance(probVector,minCutoff=0):
-    # Convert probability to distance (with dist = sqrt(-log(p)))
-    # But avoiding nonsensical computation on p=0 (set this distance to infinity)
-    distVector = np.where(probVector > minCutoff, probVector, np.inf)
-    np.log(distVector, out=distVector, where=distVector<np.inf)
-    np.sqrt(-distVector, out=distVector, where=distVector<np.inf)
-    return np.abs(distVector)
-    
-def smartGridProbability(data1, forest, data2=None):
-    # Compute probability of transition from each point in data1 to each point in data2 using PPCA models in forest
-    # If data2 is None, compute probability of transitioning between each pair in data1 
-    # Automatically use log switch for computing probability due to numerical stability
-    # Uses summarized tree structure 
-    if data2 == None: data2 = data1 # if no second data provided, compare data1 to itself
-    if (data1.ndim != 2) or (data2.ndim != 2): raise ValueError("Data1 & Data2 must be matrices")
-    D1,N1 = data1.shape
-    D2,N2 = data2.shape
-    if D1 != D2: raise ValueError("Data1 and Data2 have different dimensions")
-    
-    numTrees = forest['numTrees']
-    probability = -1*np.ones((N1,N2,numTrees))
-    progressBar = tqdm(range(numTrees))
-    for tt in progressBar:
-        progressBar.set_description(f"Measuring probability in tree {tt+1}/{numTrees} -- comparing {N1} points to {N2} points.")
-        tPathIdx = returnPathIndexLoop(data1, forest['tree'][tt])
-        tPpcaMean = forest['ppcaMeans'][tt][:,tPathIdx]
-        tPpcaInvCov = forest['ppcaInvCovs'][tt][:,:,tPathIdx]
-        tPpcaLogDet = forest['ppcaLogDets'][tt][tPathIdx]
-        for n1 in range(N1):
-            for n2 in range(N2):
-                probability[n1,n2,tt] = smartLikelihood(data2[:,n2],tPpcaMean[:,n1],tPpcaInvCov[:,:,n1],tPpcaLogDet[n1],D1)                
-    return np.median(probability,axis=2)
-    
-def smartForestLikelihood(cdata, sdata, forest):
-    N = cdata.shape[1]
-    D = forest['nDims']
-    T = forest['numTrees']
-    probability = np.empty((N,T))
-    for tt in range(T):
-        # For each tree, start by returning path index of each datapoint
-        tPathIdx = returnPathIndexLoop(cdata, forest['tree'][tt])
-        probability[:,tt] = smartTreeLikelihood(sdata, forest['ppcaMeans'][tt][:,tPathIdx], forest['ppcaInvCovs'][tt][:,:,tPathIdx], forest['ppcaLogDets'][tt][tPathIdx], D)
-    
-    return np.median(probability,axis=1)
-
-def smartTreeLikelihood(data, ppcaMean, ppcaInvCov, ppcaLogDet, D):
-    probability = np.empty(data.shape[1])
-    for dd in range(data.shape[1]):
-        probability[dd] = smartLikelihood(data[:,dd],ppcaMean[:,dd],ppcaInvCov[:,:,dd],ppcaLogDet[dd],D)
-    return probability
-
-def smartLikelihood(data, u, iS, logDet, D): 
-    udata = data - u
-    expArgument = -(1/2) * (udata.reshape(1,-1) @ iS @ udata.reshape(-1,1))
-    logLikelihood = -D/2*np.log(2*np.pi) - 1/2*logDet + expArgument
-    return np.exp(logLikelihood)
 
 def returnPathIndexLoop(cdata, tree):
     ND = cdata.shape[1]
@@ -410,7 +341,7 @@ def returnPathIndexLoop(cdata, tree):
     for nd in range(ND):
         pathIndices[nd] = returnPathIndex(cdata[:,nd],tree)
     return pathIndices
-        
+
 def returnPathIndex(cdata, tree):
     if not tree['terminalNode']: 
         # Determine appropriate leaf and go to next level
@@ -424,18 +355,128 @@ def returnPathIndex(cdata, tree):
             raise ValueError("TerminalNode found, but didn't contain an index to this tree path. Summarize tree first!")
         return tree['pathIdx']
 
+def updateNestedTree(tree, decPath, key, value):
+    # used to dynamically set value of nested dictionary (here, tree=dictioanry, decPath=list of keys,key=final key, value=value to change or set)
+    for dec in decPath:
+        tree = tree.setdefault(dec)
+    tree[key] = value
+    
+def returnNestedTree(tree, decPath, key):
+    # used to dynamically return value of nested dictionary (here, tree=dictioanry, decPath=list of keys, key=final key)
+    for dec in decPath:
+        tree = tree.setdefault(dec)
+    return tree.setdefault(key)
+
+
+# ----------------------------------------------
+# function library: measure probability with forest (using summarized trees!!!)
+# ----------------------------------------------
+def probabilityToDistance(probVector,minCutoff=0):
+    # Convert probability to distance (with dist = sqrt(-log(p)))
+    # But avoiding nonsensical computation on p=0 (set this distance to infinity)
+    distVector = np.where(probVector > minCutoff, probVector, np.inf)
+    np.log(distVector, out=distVector, where=distVector<np.inf)
+    np.sqrt(-distVector, out=distVector, where=distVector<np.inf)
+    return np.abs(distVector)
+    
+def smartGridProbability(data, forest):
+    # Compute probability of transition from each point in data to each point in data using PPCA models in forest
+    # Automatically use log switch for computing probability due to numerical stability
+    # Uses summarized tree structure 
+    if (data.ndim != 2): raise ValueError("Data must be a matrix")
+    D,N = data.shape
+    
+    numTrees = forest['numTrees']
+    probability = -1*np.ones((N,N,numTrees))
+    progressBar = tqdm(range(numTrees))
+    for tt in progressBar:
+        progressBar.set_description(f"Measuring probability in tree {tt+1}/{numTrees} -- comparing {N} points to {N} points.")
+        tPathIdx = returnPathIndexLoop(data, forest['tree'][tt])
+        tPpcaMean = forest['ppcaMeans'][tt][tPathIdx,:]
+        tPpcaInvCov = forest['ppcaInvCovs'][tt][tPathIdx,:,:]
+        tPpcaLogDet = forest['ppcaLogDets'][tt][tPathIdx]
+        for n in range(N):
+            cudata = data - tPpcaMean[n,:].reshape(D,1)
+            cexparg = (-1/2) * np.sum((tPpcaInvCov[n,:,:] @ cudata) * cudata,axis=0)
+            cloglikelihood = -D/2*np.log(2*np.pi) - 1/2*tPpcaLogDet[n] + cexparg
+            probability[n,:,tt] = np.exp(cloglikelihood)
+    return np.median(probability,axis=2)
+
+def numbaGridProbability(data, forest):
+    # Compute probability of transition from each point in data to each point in data using PPCA models in forest
+    # Automatically use log switch for computing probability due to numerical stability
+    # Uses summarized tree structure 
+    if (data.ndim != 2): raise ValueError("Data must be a matrix")
+    D,N = data.shape
+    
+    cdata = np.ascontiguousarray(data.T)
+    
+    numTrees = forest['numTrees']
+    probability = -1*np.ones((N,N,numTrees))
+    progressBar = tqdm(range(numTrees))
+    for tt in progressBar:
+        progressBar.set_description(f"Measuring probability in tree {tt+1}/{numTrees} -- comparing {N} points to {N} points.")
+        tPathIdx = returnPathIndexLoop(data, forest['tree'][tt])
+        tPpcaMean = forest['ppcaMeans'][tt][tPathIdx,:]
+        tPpcaInvCov = forest['ppcaInvCovs'][tt][tPathIdx,:,:]
+        tPpcaLogDet = forest['ppcaLogDets'][tt][tPathIdx]
+        probability[:,:,tt] = parallelLikelihoodForGrid(cdata, tPpcaMean, tPpcaInvCov, tPpcaLogDet, D)
+    return np.median(probability,axis=2)
+
+@nb.njit(nb.float64[:,::1](nb.float64[:,::1],nb.float64[:,::1],nb.float64[:,:,::1],nb.float64[::1],nb.float64), nogil=True, parallel=True)
+def parallelLikelihoodForGrid(data, u, iS, logDet, D): 
+    N = data.shape[0] 
+    probability = np.zeros((N,N))
+    for n in nb.prange(N):
+        udata = np.zeros_like(data)
+        # subtract mean
+        for n1 in range(N):
+            udata[n1,:] = data[n1,:] - u[n,:]
+        cexpargmat = (udata @ iS[n]) * udata
+        cexparg = np.zeros_like(logDet)
+        for n1 in range(N):
+            cexparg[n1] = np.sum(cexpargmat[n1,:])
+        cloglikelihood = -D/2*np.log(2*np.pi) - logDet[n]/2 - cexparg/2
+        probability[n,:] = np.exp(cloglikelihood)
+    return probability
+
+def smartForestLikelihood(cdata, sdata, forest):
+    N = cdata.shape[1]
+    D = forest['nDims']
+    T = forest['numTrees']
+    probability = np.empty((N,T))
+    for tt in range(T):
+        # For each tree, start by returning path index of each datapoint
+        tPathIdx = returnPathIndexLoop(cdata, forest['tree'][tt])
+        probability[:,tt] = fastLikelihood(sdata, forest['ppcaMeans'][tt][tPathIdx,:], forest['ppcaInvCovs'][tt][tPathIdx,:,:], forest['ppcaLogDets'][tt][tPathIdx], D)
+    return np.median(probability,axis=1)
+
+def fastLikelihood(data, u, iS, logDet, D): 
+    udata = data - u.T
+    exparg = -1/2 * np.einsum('md,mnd,nd->d',udata, iS.transpose(1,2,0), udata)
+    logLikelihood = -D/2*np.log(2*np.pi) - logDet/2 + exparg
+    return np.exp(logLikelihood)
+
+def scalarLikelihood(data, u, iS, logDet, D): 
+    if data.ndim != 1 or iS.ndim != 2: 
+        raise ValueError("Only works for single data vector (produces single scalar output)")
+    udata = data - u
+    expArgument = -(1/2) * (udata.reshape(1,-1) @ iS @ udata.reshape(-1,1))
+    logLikelihood = -D/2*np.log(2*np.pi) - 1/2*logDet + expArgument
+    return np.exp(logLikelihood)
+
+
 # --------------------------------------------
 # function library: multidimensional scaling
 # --------------------------------------------
-def initMDS(distmat,dims,method='metric'):
-    
+def initMDS(distmat,dims,method='fast'):
     if method=='fast':
         # Create double-centered squared distance matrix
         N = distmat.shape[0]
         D2 = distmat**2
         C = np.identity(N) - (1/N)*np.ones((N,N))
         B = (-1/2) * (C @ D2 @ C)
-
+        
         # Do eigendecomposition on B
         w,v = scipy.linalg.eigh(B)
         idx = np.argsort(-w) # return index of descending sort
@@ -449,29 +490,135 @@ def initMDS(distmat,dims,method='metric'):
         return mdsEmbedding.fit_transform(distmat)
     
     else:
-        raise ValueError("Didn't recognize method")
-        
+        raise ValueError("Didn't recognize method, must be method='fast' or method='metric'")
 
+def sammonMapping(distmat, coord, iterations=1000, alpha=0.1):
+    # distmat is an NxN matrix of distances
+    # coord is an NxD matrix of initial coordinates to be aligned to the distmat using sammon mapping.
+    # iterations is the number of iterations to use (might adjust if I change to conjugate gradient descent)
+    # alpha is how much to scale each update each iteration
+    N,D = coord.shape
+    error = -1*np.ones(iterations)
+    distvec = squareform(distmat)
+    
+    errorConstant = 1/np.sum(distvec)
+    
+    progressBar = tqdm(range(iterations))
+    for it in progressBar:
+        progressBar.set_description(f"Sammon Mapping Optimization: Iteration {it+1}/{iterations}")
+
+        cdistvec = pdist(coord)
+        cdistmat = squareform(cdistvec)
+
+        gradient = getGradient(distmat, cdistmat, coord, errorConstant)
+        dblgrad = getDoubleGradient(distmat, cdistmat, coord, errorConstant)
+        coord = coord - alpha * gradient / np.linalg.norm(dblgrad)
+        cdistvec = pdist(coord)
+        error[it] = sammonError(distvec, cdistvec)        
+    
+    if coord.ndim==1:
+        coord = coord.reshape(-1,1)
+    return coord, error
+
+@nb.njit(nb.float64[:,:](nb.float64[:,:],nb.float64[:,:],nb.float64[:,:],nb.float64), nogil=True, parallel=True)
+def getGradient(distmat, cdistmat, coord, errorConstant):
+    # Fast method for acquiring gradient in sammonMapping
+    gradient = np.zeros_like(coord)
+    for n in nb.prange(coord.shape[0]):
+        for d in range(coord.shape[1]):
+            for j in range(coord.shape[0]):
+                if j!=n:
+                    gradient[n,d] += -2/errorConstant * (distmat[n,j] - cdistmat[n,j])/(distmat[n,j]*cdistmat[n,j])*(coord[n,d] - coord[j,d])
+    return gradient
+
+@nb.njit(nb.float64[:,:](nb.float64[:,:],nb.float64[:,:],nb.float64[:,:],nb.float64), nogil=True, parallel=True)
+def getDoubleGradient(distmat, cdistmat, coord, errorConstant):
+    # Fast method for acquiring double gradient in sammonMapping
+    doubleGradient = np.zeros_like(coord)
+    for n in nb.prange(coord.shape[0]):
+        for d in range(coord.shape[1]):
+            for j in range(coord.shape[0]):
+                if j!=n:
+                    doubleGradient[n,d] += -2/errorConstant * (1/(distmat[n,j]*cdistmat[n,j]))*((distmat[n,j]-cdistmat[n,j]) - \
+                        (coord[n,d] - coord[j,d])**2/cdistmat[n,j]*(1+(distmat[n,j]-cdistmat[n,j])/cdistmat[n,j]))
+    return doubleGradient
+
+@nb.njit(nb.float64(nb.float64[:],nb.float64[:]), nogil=True, parallel=True)
+def sammonError(distvec, cdistvec):
+    return np.sum((distvec - cdistvec)**2/distvec) / np.sum(distvec)
+
+def centerSammonCoordinates(sammonCoord):
+    N,D = sammonCoord.shape
+    if D==1: return sammonCoord
+    uCoord = np.mean(sammonCoord, axis=0)
+    msCoord = sammonCoord - uCoord
+    covCoord = np.cov(msCoord.T, bias=True)
+    w,v = scipy.linalg.eigh(covCoord)
+    idx = np.argsort(-w) # return index of descending sort
+    w = w[idx] # sort eigenvalues
+    v = v[:,idx] # sort eigenvectors
+    return sammonCoord @ v
+
+
+# --------------------------------------------
+# function library: forward and reverse mapping
+# --------------------------------------------
+def mapping(data, scaffold, target, k, lam):
+    # data is an N x D1 array of datapoints to acquire weights for
+    # scaffold is an M x D1 array of scaffold points to approximate with
+    # target is an M x D2 array of target points associated with each scaffold point on a different manifold
+    if data.ndim == 1: data = data.reshape(1,-1)
+    ND,DD = data.shape
+    MS,DS = scaffold.shape
+    MT,DT = target.shape
+    assert DD==DS, "data and scaffold must have same number of dimensions"
+    assert MS==MT, "scaffold and target must contain the same number of datapoints"
+    idx = np.argsort(cdist(data, scaffold), axis=1)[:,:k]
+    datamap = np.empty((ND,DT))
+    for nd in range(ND):
+        cgvec = data[nd,:].reshape(1,-1) - scaffold[idx[nd,:],:]
+        cw = mapWeights(cgvec,k,lam)
+        datamap[nd,:] = np.dot(cw,target[idx[nd,:],:])
+    return datamap
+
+@nb.njit(fastmath=True)
+def mapWeights(gvec, k, lam):
+    gmat = gvec @ gvec.T
+    w = np.linalg.inv(gmat + lam*np.identity(k)) @ np.ones(k)
+    w = w / np.sum(w)
+    return w
+    
 # --------------------------------------------
 # function library: ppca model
 # --------------------------------------------
-def ppca(data, minVariance=0.95):
+def ppca(data, minVariance=0.95, weights=None):
     # probabilistic ppca - using description in Methods Section 1.7 of the following: https://www.biorxiv.org/content/10.1101/418939v2.full.pdf
     # data is a (observations x dimensions) array 
     # minVariance defines minimum fraction of variance required for fitting the PPCA model
+    # if weights provided, then perform weighted ppca 
     
     if data.ndim != 2:
         raise ValueError("data must be a matrix")
     
+    N,D = data.shape
+    
+    useEig = False
+    if weights is None:
+        useEig = True
+        weights = np.ones(N)
+    else:
+        if (weights.ndim != 1) or (len(weights) != N):
+            raise ValueError("weights must be a 1D vector with the same number of elements as the rows of data!")
+    
     # Return ML estimate of mean
-    uML = np.mean(data,axis=0)
+    uML = np.average(data,axis=0,weights=weights)
     cdata = data - uML # use centered data for computations
     
-    # Pick method based on computational speed (logic inherited from Low/Lewallen, haven't tested yet!)
-    N,D = data.shape
-    if N > D:
+    # If weights are provided, use eigendecomposition because weighted SVD exists but isn't fast
+    # Otherwise, pick method based on computational speed (logic inherited from Low/Lewallen, haven't tested yet!)
+    if useEig or (N > D):
         # do eigendecomposition
-        covData = np.cov(cdata.T, bias=True)
+        covData = np.cov(cdata.T, bias=True, aweights = weights)
         w,v = scipy.linalg.eigh(covData)
         w[w<=np.finfo(float).eps]=np.finfo(float).eps # don't allow weird tiny numbers (or negatives, it's a symmetric positive semidefinite matrix)
         idx = np.argsort(-w) # return index of descending sort
@@ -486,7 +633,7 @@ def ppca(data, minVariance=0.95):
         w = s**2 / N # eigenvalues
     
     varExplained = np.cumsum(w / np.sum(w))
-    q = int(np.where(varExplained >= minVariance)[0][0])
+    q = int(np.where(varExplained >= minVariance)[0][0])+1
     
     # Return ML estimate of noise variance
     nvML = np.mean(w[q:]) 
@@ -509,10 +656,7 @@ def ppca(data, minVariance=0.95):
 # --------------------------------------------
 # function library: data management
 # --------------------------------------------
-def returnLandmarkPoints(data, numLandmark=2000, numSeed=10, algorithm='greedy'):
-    # Can easily speed this up with Numba
-    # -- All I need to do is vectorize the minimum computation across jj's.... 
-    
+def returnLandmarkPoints(data, numLandmark=2000, numSeed=10, algorithm='greedy'):    
     # K-Medioids Algorithm (takes too long for big datasets!)
     if algorithm=='kmedioids':
         kmedoids = KMedoids(n_clusters=numLandmark).fit(data.T)
@@ -532,108 +676,6 @@ def returnLandmarkPoints(data, numLandmark=2000, numSeed=10, algorithm='greedy')
         return data[:,l],l
 
     raise ValueError("algorithm didn't match any of the available options...")
-
-    
-    
-# ----------------------------------------------
-# function library: measure probability with forest (using non-summarized trees)
-# ----------------------------------------------
-def gridProbability(data1, forest, method='log', data2=None):
-    # --- note --- can speed this up with numba significantly:
-    # ---- the trick is pulling out PPCA models with indices for data points, then finding the relevant index for each landmark point. 
-    # ---- then, I can do the likelihood computations in numba without accessing the forest dictionary
-    
-    # compute probability for each point, compared to each other point
-    if data2 == None: data2 = data1 # if no second data provided, compare data1 to itself
-    if (data1.ndim != 2) or (data2.ndim != 2): raise ValueError("Data1 & Data2 must be matrices")
-    D1,N1 = data1.shape
-    D2,N2 = data2.shape
-    if D1 != D2: raise ValueError("Data1 and Data2 have different dimensions")
-    
-    # Compute probability of each datapoint in 1 transitioning to each datapoint in data2
-    # Initialize as -1 because we're computing probability... -1 indicates failure
-    numTrees = forest['numTrees']
-    crossProbability = -1 * np.ones((N1,N2,numTrees))
-    progressBar = tqdm(range(numTrees))
-    for tt in progressBar:
-        progressBar.set_description(f"Measuring probability in tree {tt+1}/{numTrees} -- comparing {N1} points to {N2} points.")
-        for n1 in range(N1):
-            for n2 in range(N2):
-                crossProbability[n1,n2,tt] = computeProbability(data1[:,n1],data2[:,n2],forest['tree'][tt],method=method)
-
-    return np.median(crossProbability,axis=2)
-    
-    
-def forestProbability(currentData, successorData, forest, method='log'):
-    # compute probability for each transition using median of output from the forest 
-    if currentData.ndim != 2 or successorData.ndim != 2:
-        raise ValueError("data must be a matrix")
-    
-    if currentData.shape != successorData.shape:
-        raise ValueError("current data and successor data must have same shape")
-    
-    # important variables for function
-    N,D = currentData.shape # N=number of neurons, D=number of datapoints (in this node)
-    NT = forest['numTrees']
-    
-    probability = -1*np.ones((D,NT))
-    progressBar = tqdm(range(NT))
-    for tt in progressBar:
-        progressBar.set_description(f'Measuring probability from tree {tt+1}/{NT}')
-        for dd in range(D):
-            probability[dd,tt] = computeProbability(currentData[:,dd],successorData[:,dd],forest['tree'][tt],method=method)
-    
-    return np.median(probability,axis=1)
-
-def getProbability(currentData, successorData, tree, method='log'):
-    # for each point in current data, output the probability of observing it's associated successor data by navigating tree and measuring likelihood
-    if currentData.ndim != 2 or successorData.ndim != 2:
-        raise ValueError("data must be a matrix")
-    
-    if currentData.shape != successorData.shape:
-        raise ValueError("current data and successor data must have same shape")
-    
-    # important variables for function
-    N,D = currentData.shape # N=number of neurons, D=number of datapoints (in this node)
-    
-    probability = -1*np.ones(D)
-    for dd in range(D):
-        probability[dd] = computeProbability(currentData[:,dd],successorData[:,dd],tree,method=method)
-    
-    return probability
-    
-def computeProbability(cdata,sdata,tree,method='log'):
-    # Compute probability of sdata from cdata using PPCA model in tree
-    # method is a switch which controls how the likelihood is computed (logarithm is better numerically usually)
-    if not tree['terminalNode']: 
-        # Determine appropriate leaf and go to next level
-        cproj = tree['hyperplane']['direction'].reshape(1,-1) @ cdata.reshape(-1,1)
-        if cproj <= tree['hyperplane']['threshold']:
-            return computeProbability(cdata,sdata, tree['left'])
-        else:
-            return computeProbability(cdata,sdata, tree['right'])
-    else:
-        # Otherwise, confirm we have a PPCA model and return probability
-        if not checkValidPPCA(tree):
-            raise ValueError("TerminalNode found, but didn't have a valid PPCA model")
-        return likelihood(sdata, tree['mean'], tree['covariance'], tree['invcov'], method=method)
-
-def likelihood(data, u, S, iS, method='log'): # add iS back to this 
-    D = data.shape[0]
-    udata = data - u
-    expArgument = -(1/2) * (udata.T @ iS @ udata)
-    if method=='log':
-        # Measure log likelihood first
-        smartLogDet = 2*np.log(np.prod(np.diag(np.linalg.cholesky(S))))
-        logLikelihood = -D/2*np.log(2*np.pi) - 1/2*smartLogDet + expArgument
-        # Then convert back to likelihood
-        likelihood = np.exp(logLikelihood)
-    elif method=='exp':
-        likelihood = np.exp(expArgument) / np.sqrt((2*np.pi)**D * np.linalg.det(S))
-    else:
-        raise ValueError("Did not recognize method, must be 'log' or 'exp'")
-    
-    return likelihood
 
 
 # --------------------------------------------
