@@ -396,6 +396,7 @@ class mindModel:
         if (updateObject==False) and (returnCoord==False):
             print("Either updateObject or returnCoord must be set to True. Exiting function.")
             return 
+        assert dims>=1 and isinstance(dims,int), "dims must be positive integer"
         
         # Start by initializing MDS coordinates with the closed from eigendecomposition solution 
         D2 = self.scafDist**2
