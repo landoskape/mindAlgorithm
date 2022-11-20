@@ -40,7 +40,7 @@ def ppca(data, method='minVariance', dimPrm=0.95, weights=None):
     N,D = data.shape # N=numObservations, D=numDimensions
     assert (method=='minVariance') or (method=='numComponents'), "Method must be set to either 'minVariance' or 'numComponents'"
     if method=='minVariance': assert (dimPrm>0) and (dimPrm<=1), "if using minVariance method, dimPrm must be in the set (0,1]"
-    if method=='numComponents': assert (dimPrm>0) and (dimPrm<=D) and isinstance(dimPrm,int), \
+    if method=='numComponents': assert (dimPrm>0) and (dimPrm<=D) and (isinstance(dimPrm,int) or np.issubdtype(dimPrm,np.integer)), \
         "if using numcomponents method, dimPrm must be a positive integer less than or equal to the number of dimensions in data"
     if (method=='minVariance') and (dimPrm==1):
         method='numComponents'

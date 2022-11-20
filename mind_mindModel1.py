@@ -14,6 +14,8 @@ from scipy.spatial.distance import squareform, pdist, cdist
 from sklearn.manifold import MDS as skMDS
 from sklearn_extra.cluster import KMedoids
 from tqdm.notebook import tqdm, trange
+from ipywidgets import IntProgress
+from IPython.display import display, clear_output
 
 # top level model
 class mindModel:
@@ -32,8 +34,8 @@ class mindModel:
         self.opts['rf_method'] = 'minVariance' # which method to use for PPCA models in random forest (either 'minVariance' or 'numComponents')
         self.opts['rf_dimPrm'] = 0.95 # desired fraction of variance to explain with PPCA models (or number of components to keep)
         # Options for landmark points
-        self.opts['scaffoldPoints'] = 2000 # number of landmark points to create
-        self.opts['scaffoldSeeds'] = 1 # number of landmark seeds to initiate algorithm with
+        self.opts['numScafPoints'] = 2000 # number of landmark points to create
+        self.opts['numScafSeeds'] = 1 # number of landmark seeds to initiate algorithm with
         self.opts['scaffoldAlgorithm'] = 'greedy' # algorithm (can be 'greedy' or 'kmedoids'), k-medoids takes far too long and is unnecessary
         # Options for MDS
         self.opts['mdsSammonIterations'] = 800 # until this is coded with conjugate gradient descent, just use # of landmark points...
@@ -69,8 +71,8 @@ class mindModel:
         self.ppcaInvCovs = []
         self.ppcaLogDets = []
         # scaffold variables
-        self.scaffoldPoints = self.opts['scaffoldPoints']
-        self.scaffoldSeeds = self.opts['scaffoldSeeds']
+        self.numScafPoints = self.opts['numScafPoints']
+        self.numScafSeeds = self.opts['numScafSeeds']
         self.scaffoldAlgorithm = self.opts['scaffoldAlgorithm']
         self.scafIdx = []
         self.scafData = []
@@ -86,14 +88,16 @@ class mindModel:
         self.mdsSammonAlpha = self.opts['mdsSammonAlpha']
         
         # Forward/Reverse Mapping Variables
-        self.mappingForwardOptDim = []
-        self.mappingBackwardOptDim = []
         self.mappingForwardK = []
         self.mappingForwardLambda = []
         self.mappingBackwardK = []
         self.mappingBackwardLambda = []
         self.mappingOptionsK = np.arange(2,21)
         self.mappingOptionsLambda = np.logspace(-6,1,30)
+        self.mappingForwardOptDim = []
+        self.mappingBackwardOptDim = []
+        self.mappingForwardOptionsError = []
+        self.mappingBackwardOptionsError = []
         
     def addData(self, data):
         self.data = data
@@ -357,50 +361,43 @@ class mindModel:
     # -- handle landmarks --
     # ----------------------
     def constructScaffold(self):
-        # K-Medioids Algorithm (takes too long for big datasets!)
-        assert self.scaffoldAlgorithm=='kmedoids' or self.scaffoldAlgorithm=='greedy', "lmAlgorithm must be set to 'kmedoids' or 'greedy'"
-        
-        if self.scaffoldAlgorithm=='kmedoids':
-            kmedoids = KMedoids(n_clusters=self.scaffoldPoints).fit(self.drData)
-            self.scafIdx = kmedoids.medoid_indices_
-            self.scafData = kmedoids.cluster_centers_
-            
         # Greedy algorithm: http://graphics.stanford.edu/courses/cs468-05-winter/Papers/Landmarks/Silva_landmarks5.pdf
-        if self.scaffoldAlgorithm=='greedy':
-            l = np.zeros(self.scaffoldPoints,dtype=int)
-            l[:self.scaffoldSeeds] = np.random.choice(self.numObs,self.scaffoldSeeds,replace=False)
-            m = np.min(scipy.spatial.distance.cdist(self.drData[l[:self.scaffoldSeeds],:],self.drData,metric='Euclidean'),axis=0)
-            for ii in range(self.scaffoldSeeds,self.scaffoldPoints):
-                # Set next landmark to datapoint furthest from other datapoints
-                l[ii] = np.argmax(m)
-                m = np.minimum(m, np.sum((self.drData[l[ii],:] - self.drData)**2,axis=1))
-            self.scafIdx = l
-            self.scafData = self.drData[l,:]
-    
+        l = np.zeros(self.numScafPoints,dtype=int)
+        l[:self.numScafSeeds] = np.random.choice(self.numObs,self.numScafSeeds,replace=False)
+        m = np.min(scipy.spatial.distance.cdist(self.drData[l[:self.numScafSeeds],:],self.drData,metric='Euclidean'),axis=0)
+        for ii in range(self.numScafSeeds,self.numScafPoints):
+            # Set next landmark to datapoint furthest from other datapoints
+            l[ii] = np.argmax(m)
+            m = np.minimum(m, np.sum((self.drData[l[ii],:] - self.drData)**2,axis=1))
+        self.scafIdx = l
+        self.scafData = self.drData[l,:]
+
         self.scafGridProb = self.smartGridProbability(self.scafData)
         self.scafTrProb = self.scafGridProb / np.sum(self.scafGridProb,axis=1).reshape(-1,1)
         assert np.allclose(np.sum(self.scafTrProb,axis=1),1), "sum(trProb,axis=1) does not all equal(close-to) 1!"
         self.scafLocalDist = probabilityToDistance(self.scafTrProb)
         self.scafGlobalDist = scipy.sparse.csgraph.johnson(self.scafLocalDist)
-        sgdMinimum = np.minimum(self.scafGlobalDist, self.scafGlobalDist.T)
-        sgdInfinite = np.logical_or(self.scafGlobalDist==np.inf, self.scafGlobalDist.T==np.inf)
-        self.scafDist = (self.scafGlobalDist + self.scafGlobalDist.T)/2
-        self.scafDist[sgdInfinite] = sgdMinimum[sgdInfinite]
+        sgdMinimum = np.minimum(self.scafGlobalDist, self.scafGlobalDist.T) # take minimum transition distance for each pairwise transition 
+        sgdInfinite = np.logical_or(self.scafGlobalDist==np.inf, self.scafGlobalDist.T==np.inf) # True if either transition distance is infinite
+        self.scafDist = (self.scafGlobalDist + self.scafGlobalDist.T)/2 # Will be infinite if either transition distance is infinite
+        self.scafDist[sgdInfinite] = sgdMinimum[sgdInfinite] # If one side is infinite, use minimum transition distance
         assert np.all(self.scafDist >= 0), "Some of the scaffold distances are negative. This probably means that smartGridProbability() is broken."
-        assert np.all(self.scafDist != np.inf), "Some of the scaffold distance are infinite. This means that Johnson's algorithm couldn't find a path between at least 1 pair of points in either direction."
+        assert np.all(self.scafDist != np.inf), "Some of the scaffold distance are infinite. This means that Johnson's algorithm couldn't find a path between at least 1 pair of points in either direction. This sometimes happens when temporal resolution is too high, so datapoints are too close together in state space."
         
     # ------------------------------
     # -- multidimensional scaling --
     # ------------------------------
-    def performMDS(self, dims, updateObject=True, returnCoord=False):
-        if (updateObject==False) and (returnCoord==False):
-            print("Either updateObject or returnCoord must be set to True. Exiting function.")
-            return 
-        assert dims>=1 and isinstance(dims,int), "dims must be positive integer"
+    def performMDS(self, dims, updateObject=True, returnCoord=False, verbose=True):
+        # dims=the number of dims used for mapping numScafPoints onto a new manifold
+        # this function can save coordinates to the mind object (updateObject=True) and return coordinates outside the function (returnCoord=True). 
+        # -- if neither are set to True, this function has no effect so it aborts before doing anything! --
+        # verbose determines whether to use a progress bar for the iterations of sammon mapping
+        if (updateObject==False) and (returnCoord==False): print("Either updateObject or returnCoord must be set to True. Exiting function."); return 
+        assert dims>=1 and (isinstance(dims,int) or np.issubdtype(dims, np.integer)), "dims must be positive integer"
         
         # Start by initializing MDS coordinates with the closed from eigendecomposition solution 
         D2 = self.scafDist**2
-        C = np.identity(self.scaffoldPoints) - (1/self.scaffoldPoints)*np.ones((self.scaffoldPoints,self.scaffoldPoints))
+        C = np.identity(self.numScafPoints) - (1/self.numScafPoints)*np.ones((self.numScafPoints,self.numScafPoints))
         B = (-1/2) * (C @ D2 @ C)
         
         # Do eigendecomposition on B
@@ -419,7 +416,7 @@ class mindModel:
         
         errorConstant = 1/np.sum(distvec)
         
-        progressBar = tqdm(range(self.mdsSammonIterations))
+        progressBar = tqdm(range(self.mdsSammonIterations),disable=(not verbose))
         for it in progressBar:
             progressBar.set_description(f"Performing sammon mapping: Iteration {it+1}/{self.mdsSammonIterations}")
             
@@ -436,7 +433,7 @@ class mindModel:
         
         # Center coordinates
         if dims>1:
-            v = mppca.ppcaFull(mdsCoord, method='numComponents', dimPrm=dims)[0] # return all eigenvectors
+            v = mppca.ppca(mdsCoord, method='numComponents', dimPrm=dims)[0] # return all eigenvectors
             mdsCoord = (mdsCoord - np.mean(mdsCoord,axis=0)) @ v
         else:
             mdsCoord = mdsCoord - np.mean(mdsCoord)
@@ -447,6 +444,24 @@ class mindModel:
     # ---------------------------------------------
     # function library: forward and reverse mapping
     # ---------------------------------------------
+    def mapping(self, data, scaffold, target, k, lam):
+        # data is an N x D1 array of datapoints to acquire weights for
+        # scaffold is an M x D1 array of scaffold points to approximate with
+        # target is an M x D2 array of target points associated with each scaffold point on a different manifold
+        if data.ndim == 1: data = data.reshape(1,-1)
+        ND,DD = data.shape
+        MS,DS = scaffold.shape
+        MT,DT = target.shape
+        assert DD==DS, "data and scaffold must have same number of dimensions"
+        assert MS==MT, "scaffold and target must contain the same number of datapoints"
+        idx = np.argsort(cdist(data, scaffold), axis=1)[:,:k]
+        datamap = np.empty((ND,DT))
+        for nd in range(ND):
+            cgvec = data[nd,:].reshape(1,-1) - scaffold[idx[nd,:],:]
+            cw = mapWeights(cgvec,k,lam)
+            datamap[nd,:] = np.dot(cw,target[idx[nd,:],:])
+        return datamap
+    
     def forwardMapping(self, data):
         if self.scafManifold is None:
             raise ValueError("Forward mapping can only be used if the scaffold is already mapped to a manifold. Use performMDS with updateObject=True to do so.")
@@ -472,77 +487,172 @@ class mindModel:
         if data.ndim==1: data=data.reshape(1,-1)
         assert data.shape[1]==self.scafManifold.shape[1], "for backward mapping, data must have same dimensions as most recently set MDS coordinates of the scaffold points" 
         return self.mapping(data, self.scafManifold, self.scafData, self.mappingBackwardK, self.mappingBackwardLambda)
-        
-    def mapping(self, data, scaffold, target, k, lam):
-        # data is an N x D1 array of datapoints to acquire weights for
-        # scaffold is an M x D1 array of scaffold points to approximate with
-        # target is an M x D2 array of target points associated with each scaffold point on a different manifold
-        if data.ndim == 1: data = data.reshape(1,-1)
-        ND,DD = data.shape
-        MS,DS = scaffold.shape
-        MT,DT = target.shape
-        assert DD==DS, "data and scaffold must have same number of dimensions"
-        assert MS==MT, "scaffold and target must contain the same number of datapoints"
-        idx = np.argsort(cdist(data, scaffold), axis=1)[:,:k]
-        datamap = np.empty((ND,DT))
-        for nd in range(ND):
-            cgvec = data[nd,:].reshape(1,-1) - scaffold[idx[nd,:],:]
-            cw = mapWeights(cgvec,k,lam)
-            datamap[nd,:] = np.dot(cw,target[idx[nd,:],:])
-        return datamap
 
-    def optimizeForwardMapping(self, numIterations=5, frac2test=0.1, kOptions=None, lamOptions=None):
-        # optimize forward mapping using euclidean distance between scaffoldData and scaffoldManifold
+    def optimizeForwardMapping(self, dims2use, numIterations=5, frac2test=0.1, kOptions=None, lamOptions=None):
+        # optimize forward mapping using euclidean distance between scaffoldData and scaffoldManifold using a desired dimensionality
         # can choose how many iterations to do, what fraction of scaffold points to test, and the options for k and lambda
         if kOptions is None: kOptions = self.mappingOptionsK
         if lamOptions is None: lamOptions = self.mappingOptionsLambda
         NK = len(kOptions)
         NL = len(lamOptions)
-        netError = np.zeros((numIterations,NK,NL))
-        numTest = int(self.scaffoldPoints * frac2test)
-        for it in range(numIterations):
-            idxMap = np.random.choice(self.scaffoldPoints, numTest, replace=False)
-            idxScaf = np.delete(np.arange(self.scaffoldPoints), idxMap)
-            for ki in range(NK):
-                for li in range(NL):
-                    testMap = self.mapping(self.scafData[idxMap,:], self.scafData[idxScaf,:], self.scafManifold[idxScaf,:], kOptions[ki], lamOptions[li])
-                    netError[it,ki,li] = np.sqrt(np.sum((self.scafManifold[idxMap,:] - testMap)**2))
-        totalError = np.mean(netError,axis=0)
-        idxBest = np.unravel_index(np.argmin(totalError),totalError.shape)
-        if idxBest[0]==0: print("Alert: best k in optimizeForwardMapping was an edge case (the smallest option). Consider expanding search.")
-        if idxBest[0]==NK-1: print("Alert: best k in optimizeForwardMapping was an edge case (the largest option). Consider expanding search.")
-        if idxBest[1]==0: print("Alert: best lambda in optimizeForwardMapping was an edge case (the smallest option). Consider expanding search.")
-        if idxBest[1]==NL-1: print("Alert: best lambda in optimizeForwardMapping was an edge case (the largest option). Consider expanding search.")
-        self.mappingForwardK = kOptions[idxBest[0]]
-        self.mappingForwardLambda = lamOptions[idxBest[1]]
-        self.mappingForwardOptDim = self.scafManifold.shape[1]
+        numTest = int(self.numScafPoints * frac2test)
+        edgeFlags = np.zeros((4,len(dims2use)))
         
-    def optimizeBackwardMapping(self, numIterations=5, frac2test=0.1, kOptions=None, lamOptions=None):
-        # optimize backward mapping using euclidean distance between scaffoldData and scaffoldManifold
+        tStart = time.time()
+        for dimidx, dim in enumerate(dims2use):
+            elapsedTime = time.time() - tStart
+            if dimidx>0: eta=elapsedTime * len(dims2use)/dimidx
+            else: eta=np.nan
+            print(f"Optimizing forward mapping for dim={dim}, completed {dimidx}/{len(dims2use)} in {(time.time()-tStart):.1f} seconds, eta of finish: {(eta):.1f}")
+            if dim in self.mappingForwardOptDim:
+                # If this dimensionality has already been optimized, replace the values
+                replace = True
+                dimIdxInObject = self.mappingForwardOptDim.index(dim)
+            else: 
+                # Otherwise, append to end of optimization values
+                replace = False
+            
+            if len(self.scafManifold)>0 and (dim==self.scafManifold.shape[1]):
+                # If stored manfiold coordinates are same as requested dimension, use them
+                print(f"Using previously computed manifold coordinates that match current dimensionality...")
+                scafManifold = self.scafManifold
+            else:
+                # Otherwise, generate coordinates without saving
+                print(f"Generating manifold coordinates...")
+                scafManifold = self.performMDS(dim, updateObject=False, returnCoord=True, verbose=False)
+            
+            # Generate display variables for tracking progress...
+            iterationBar = IntProgress(min=0, max=numIterations-1)
+            kLambdaOptionsBar = IntProgress(min=0, max=(NK-1)*(NL-1))
+            display(iterationBar)
+            display(kLambdaOptionsBar)
+            
+            netError = np.zeros((numIterations,NK,NL))
+            for it in range(numIterations):
+                iterationBar.value=it
+                iterationBar.description=f"Iteration {it+1}/{numIterations}"
+                idxMap = np.random.choice(self.numScafPoints, numTest, replace=False)
+                idxScaf = np.delete(np.arange(self.numScafPoints), idxMap)
+                for ki in range(NK):
+                    for li in range(NL):
+                        kLambdaOptionsBar.value=ki*NL+li
+                        kLambdaOptionsBar.description=f"K/Lambda: {li+1}/{NL*NK}"
+                        testMap = self.mapping(self.scafData[idxMap,:], self.scafData[idxScaf,:], scafManifold[idxScaf,:], kOptions[ki], lamOptions[li])
+                        netError[it,ki,li] = np.sqrt(np.sum((scafManifold[idxMap,:] - testMap)**2))
+            
+            totalError = np.mean(netError,axis=0)
+            idxBest = np.unravel_index(np.argmin(totalError),totalError.shape)
+            if idxBest[0]==0: edgeFlags[0,dimidx] = 1
+            if idxBest[0]==NK-1: edgeFlags[1,dimidx] = 1
+            if idxBest[1]==0: edgeFlags[2,dimidx] = 1
+            if idxBest[1]==NL-1: edgeFlags[3,dimidx] = 1
+            if replace:
+                self.mappingForwardK[dimIdxInObject] = kOptions[idxBest[0]]
+                self.mappingForwardLambda[dimIdxInObject] = lamOptions[idxBest[1]]
+                self.mappingForwardOptDim[dimIdxInObject] = dim
+                self.mappingForwardOptionsError[dimIdxInObject] = totalError
+            else:
+                self.mappingForwardK.append(kOptions[idxBest[0]])
+                self.mappingForwardLambda.append(lamOptions[idxBest[1]])
+                self.mappingForwardOptDim.append(dim)
+                self.mappingForwardOptionsError.append(totalError)
+            clear_output(wait=True)
+        print(f"Optimizing forward mapping finished for dims={dims2use} in {(time.time()-tStart):.1f} seconds.")
+        if np.any(edgeFlags[0,:]): print(f"Alert: the smallest k (k={np.min(kOptions)}) was selected for dim={dims2use[edgeFlags[0,:]==1]}. Consider expanding search.")
+        if np.any(edgeFlags[1,:]): print(f"Alert: the largest k (k={np.max(kOptions)}) was selected for dim={dims2use[edgeFlags[1,:]==1]}. Consider expanding search.")
+        if np.any(edgeFlags[2,:]): print(f"Alert: the smallest lambda ({np.min(lamOptions)}) was selected for dim={dims2use[edgeFlags[2,:]==1]}. Consider expanding search.")
+        if np.any(edgeFlags[3,:]): print(f"Alert: the largest lambda ({np.max(lamOptions)}) was selected for dim={dims2use[edgeFlags[3,:]==1]}. Consider expanding search.")
+    
+    
+    def optimizeBackwardMapping(self, dims2use, numIterations=5, frac2test=0.1, kOptions=None, lamOptions=None):
+        # optimize backward mapping using euclidean distance between scaffoldData and scaffoldManifold using a desired dimensionality
         # can choose how many iterations to do, what fraction of scaffold points to test, and the options for k and lambda
         if kOptions is None: kOptions = self.mappingOptionsK
         if lamOptions is None: lamOptions = self.mappingOptionsLambda
         NK = len(kOptions)
         NL = len(lamOptions)
-        netError = np.zeros((numIterations,NK,NL))
-        numTest = int(self.scaffoldPoints * frac2test)
-        for it in range(numIterations):
-            idxMap = np.random.choice(self.scaffoldPoints, numTest, replace=False)
-            idxScaf = np.delete(np.arange(self.scaffoldPoints), idxMap)
-            for ki in range(NK):
-                for li in range(NL):
-                    testMap = self.mapping(self.scafManifold[idxMap,:], self.scafManifold[idxScaf,:], self.scafData[idxScaf,:], kOptions[ki], lamOptions[li])
-                    netError[it,ki,li] = np.sqrt(np.sum((self.scafData[idxMap,:] - testMap)**2))
-        totalError = np.mean(netError,axis=0)
-        idxBest = np.unravel_index(np.argmin(totalError),totalError.shape)
-        if idxBest[0]==0: print("Alert: best k in optimizeBackwardMapping was an edge case (the smallest option). Consider expanding search.")
-        if idxBest[0]==NK-1: print("Alert: best k in optimizeBackwardMapping was an edge case (the largest option). Consider expanding search.")
-        if idxBest[1]==0: print("Alert: best lambda in optimizeBackwardMapping was an edge case (the smallest option). Consider expanding search.")
-        if idxBest[1]==NL-1: print("Alert: best lambda in optimizeBackwardMapping was an edge case (the largest option). Consider expanding search.")
-        self.mappingBackwardK = kOptions[idxBest[0]]
-        self.mappingBackwardLambda = lamOptions[idxBest[1]]
-        self.mappingBackwardOptDim = self.scafManifold.shape[1]
+        numTest = int(self.numScafPoints * frac2test)
+        edgeFlags = np.zeros((4,len(dims2use)))
         
+        tStart = time.time()
+        for dimidx, dim in enumerate(dims2use):
+            elapsedTime = time.time() - tStart
+            if dimidx>0: eta=elapsedTime * len(dims2use)/dimidx
+            else: eta=np.nan
+            print(f"Optimizing backward mapping for dim={dim}, completed {dimidx}/{len(dims2use)} in {(time.time()-tStart):.1f} seconds, eta of finish: {(eta):.1f}")
+            if dim in self.mappingBackwardOptDim:
+                # If this dimensionality has already been optimized, replace the values
+                replace = True
+                dimIdxInObject = self.mappingBackwardOptDim.index(dim)
+            else: 
+                # Otherwise, append to end of optimization values
+                replace = False
+            
+            if len(self.scafManifold)>0 and (dim==self.scafManifold.shape[1]):
+                # If stored manfiold coordinates are same as requested dimension, use them
+                print(f"Using previously computed manifold coordinates that match current dimensionality...")
+                scafManifold = self.scafManifold
+            else:
+                # Otherwise, generate coordinates without saving
+                print(f"Generating manifold coordinates...")
+                scafManifold = self.performMDS(dim, updateObject=False, returnCoord=True, verbose=False)
+            
+            # Generate display variables for tracking progress...
+            iterationBar = IntProgress(min=0, max=numIterations-1)
+            kLambdaOptionsBar = IntProgress(min=0, max=(NK-1)*(NL-1))
+            display(iterationBar)
+            display(kLambdaOptionsBar)
+            
+            netError = np.zeros((numIterations,NK,NL))
+            for it in range(numIterations):
+                iterationBar.value=it
+                iterationBar.description=f"Iteration {it+1}/{numIterations}"
+                idxMap = np.random.choice(self.numScafPoints, numTest, replace=False)
+                idxScaf = np.delete(np.arange(self.numScafPoints), idxMap)
+                for ki in range(NK):
+                    for li in range(NL):
+                        kLambdaOptionsBar.value=ki*NL+li
+                        kLambdaOptionsBar.description=f"K/Lambda: {li+1}/{NL*NK}"
+                        testMap = self.mapping(scafManifold[idxMap,:], scafManifold[idxScaf,:], self.scafData[idxScaf,:], kOptions[ki], lamOptions[li])
+                        netError[it,ki,li] = np.sqrt(np.sum((self.scafData[idxMap,:] - testMap)**2))
+            
+            totalError = np.mean(netError,axis=0)
+            idxBest = np.unravel_index(np.argmin(totalError),totalError.shape)
+            if idxBest[0]==0: edgeFlags[0,dimidx] = 1
+            if idxBest[0]==NK-1: edgeFlags[1,dimidx] = 1
+            if idxBest[1]==0: edgeFlags[2,dimidx] = 1
+            if idxBest[1]==NL-1: edgeFlags[3,dimidx] = 1
+            if replace:
+                self.mappingBackwardK[dimIdxInObject] = kOptions[idxBest[0]]
+                self.mappingBackwardLambda[dimIdxInObject] = lamOptions[idxBest[1]]
+                self.mappingBackwardOptDim[dimIdxInObject] = dim
+                self.mappingBackwardOptionsError[dimIdxInObject] = totalError
+            else:
+                self.mappingBackwardK.append(kOptions[idxBest[0]])
+                self.mappingBackwardLambda.append(lamOptions[idxBest[1]])
+                self.mappingBackwardOptDim.append(dim)
+                self.mappingBackwardOptionsError.append(totalError)
+            clear_output(wait=True)
+        print(f"Optimizing backward mapping finished for dims={dims2use} in {(time.time()-tStart):.1f} seconds.")
+        if np.any(edgeFlags[0,:]): print(f"Alert: the smallest k (k={np.min(kOptions)}) was selected for dim={dims2use[edgeFlags[0,:]==1]}. Consider expanding search.")
+        if np.any(edgeFlags[1,:]): print(f"Alert: the largest k (k={np.max(kOptions)}) was selected for dim={dims2use[edgeFlags[1,:]==1]}. Consider expanding search.")
+        if np.any(edgeFlags[2,:]): print(f"Alert: the smallest lambda ({np.min(lamOptions)}) was selected for dim={dims2use[edgeFlags[2,:]==1]}. Consider expanding search.")
+        if np.any(edgeFlags[3,:]): print(f"Alert: the largest lambda ({np.max(lamOptions)}) was selected for dim={dims2use[edgeFlags[3,:]==1]}. Consider expanding search.")
+        
+    def getMappingParameters(self, dim, direction='forward'):
+        assert direction=='forward' or direction=='backward', "direction must be set to either 'forward' or 'backward'"
+        if direction=='forward':
+            assert dim in self.mappingForwardOptDim, f"Forward mapping has not been optimized for D={dim} yet."
+            idxForward = self.mappingForwardOptDim.index(dim)
+            k = self.mappingForwardK[idxForward]
+            lam = self.mappingForwardLambda[idxForward]
+        if direction=='backward':
+            assert dim in self.mappingBackwardOptDim, f"Backward mapping has not been optimized for D={dim} yet."
+            idxBackward = self.mappingBackwardOptDim.index(dim)
+            k = self.mappingBackwardK[idxBackward]
+            lam = self.mappingBackwardLambda[idxBackward]
+        return k, lam
+            
     # -----------------------
     # -- forest processing --
     # -----------------------
@@ -618,6 +728,15 @@ class mindModel:
 # --------------------------------------------------
 # -------------- supporting functions --------------
 # --------------------------------------------------
+def reconstructionError(data, reconstruction):
+    assert data.ndim==2, "data must be a matrix"
+    assert reconstruction.ndim==2, "reconstruction must be a matrix"
+    assert data.shape==reconstruction.shape, "data and reconstruction must have same shape"
+    udata = np.mean(data,axis=1)
+    devFromMean = np.mean(np.sum((data - udata.reshape(-1,1))**2,axis=1))
+    devFromRecon = np.mean(np.sum((data - reconstruction)**2,axis=1))
+    return 1-devFromRecon/devFromMean
+    
 def probabilityToDistance(probVector,minCutoff=0):#np.finfo(np.float64).eps):
     # Convert probability to distance (with dist = sqrt(-log(p)))
     # But avoiding nonsensical computation on p=0 (set this distance to infinity)
