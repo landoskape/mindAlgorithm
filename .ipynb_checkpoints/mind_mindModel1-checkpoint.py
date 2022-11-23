@@ -76,7 +76,6 @@ class mindModel:
         self.scaffoldAlgorithm = self.opts['scaffoldAlgorithm']
         self.scafIdx = []
         self.scafData = []
-        self.scafManifold = [] # coordinates of data in manifold space
         self.scafGridProb = []
         self.scafTrProb = []
         self.scafLocalDist = []
@@ -84,6 +83,8 @@ class mindModel:
         self.scafDist = [] # symmetric distance b/w landmark points        
         
         # MDS variables
+        self.scafManifold = [] # coordinates of data in manifold space
+        self.scafManifoldDim = [] # dimensions for each scafManifold
         self.mdsSammonIterations = self.opts['mdsSammonIterations']
         self.mdsSammonAlpha = self.opts['mdsSammonAlpha']
         
@@ -114,20 +115,38 @@ class mindModel:
     # -------------------------
     # -- Forest Construction --
     # -------------------------
-    def constructForest(self,numTrees):
+    def constructForest(self,numTrees,simpleUpdates=False):
         cdata = self.drData[:-1,:]
         sdata = self.drData[1:,:]
-        progressBar = tqdm(range(numTrees))
+        
+        # Use simple update switch because tqdm doesn't work on my laptop
+        if simpleUpdates: tstart = time.time()
+            
+        progressBar = tqdm(range(numTrees),disable=simpleUpdates)
         for tt in progressBar:
+            if simpleUpdates: 
+                eta = (time.time() - tstart) * numTrees/(tt+1)
+                if tt==0: eta = np.nan
+                print(f"Fitting PPCA Tree {tt+1}/{numTrees}, eta: {eta:.1f} seconds...")
+                
             progressBar.set_description(f'Fitting PPCA Tree {tt+1}/{numTrees}')
             self.forest.append(self.splitForestNode(cdata,sdata))
             self.numTrees += 1
+            if simpleUpdates and tt>0: eta=numTrees/(tt+1)*(time.time()-tstart)
             
-    def addTrees(self,numTrees):
+    def addTrees(self,numTrees,simpleUpdates=False):
         cdata = self.drData[:-1,:]
         sdata = self.drData[1:,:]
-        progressBar = tqdm(range(numTrees))
+        
+        if simpleUpdates: tstart = time.time()
+            
+        progressBar = tqdm(range(numTrees),disable=simpleUpdates)
         for newTree in progressBar:
+            if simpleUpdates:
+                eta = (time.time() - tstart) * numTrees/(newTree+1)
+                if newTree==0: eta = np.nan
+                print(f"Fitting PPCA Tree {newTree+1}/{numTrees}, eta: {eta:.1f} seconds...")
+            
             progressBar.set_description(f'Adding PPCA Tree {newTree+1}/{numTrees}')
             self.forest.append(self.splitForestNode(cdata,sdata))
             self.numTrees += 1
@@ -243,10 +262,11 @@ class mindModel:
         return hpNormal, hpThreshold, leftPPCA, rightPPCA, cdata[idxLeft,:], sdata[idxLeft,:], cdata[idxRight,:], sdata[idxRight,:]
     
     def checkContainsPPCA(self,node):
-        # Take in dictionary, check if it contains a valid PPCA model
+        # Take in (node) dictionary, check if it contains a valid PPCA model
         containsPPCA = False
-        if 'ppca' not in node.keys(): return # if there's no ppca key, then there's no ppca model...
-        if isinstance(node['ppca'],mppca.ppcaModel): containsPPCA=True
+        if ('ppca' in node.keys()) and isinstance(node['ppca'],mppca.ppcaModel): containsPPCA=True
+        # if 'ppca' not in node.keys(): return # if there's no ppca key, then there's no ppca model...
+        # if isinstance(node['ppca'],mppca.ppcaModel): containsPPCA=True
         return containsPPCA
     
     def summarizeForest(self, removeOriginal=False):
@@ -387,13 +407,28 @@ class mindModel:
     # ------------------------------
     # -- multidimensional scaling --
     # ------------------------------
-    def performMDS(self, dims, updateObject=True, returnCoord=False, verbose=True):
+    def performMDS(self, dims, recompute=False, returnCoord=False, verbose=True):
         # dims=the number of dims used for mapping numScafPoints onto a new manifold
-        # this function can save coordinates to the mind object (updateObject=True) and return coordinates outside the function (returnCoord=True). 
-        # -- if neither are set to True, this function has no effect so it aborts before doing anything! --
+        # this function performs MDS on scaffold points for a given dimension
+        # if it exists already, it'll just pull them from storage
+        # if it doesn't exist, it'll recompute them
+        # coordinates only returned out of function if requested explicitly
+        # if recompute=False, returnCoord=False, and coordinates have already been computed, then this function has no effect so it aborts before doing anything! --
         # verbose determines whether to use a progress bar for the iterations of sammon mapping
-        if (updateObject==False) and (returnCoord==False): print("Either updateObject or returnCoord must be set to True. Exiting function."); return 
+        
         assert dims>=1 and (isinstance(dims,int) or np.issubdtype(dims, np.integer)), "dims must be positive integer"
+        
+        # If already computed, no recompute, and returning, then return existing coordinates
+        if (dims in self.scafManifoldDim) and (not recompute) and returnCoord:
+            dimidx = self.scafManifoldDim.index(dims)
+            return self.scafManifold[dimidx]
+        
+        # If already computed, no recompute, and not returning, return empty
+        if (dims in self.scafManifoldDim) and (not recompute) and (not returnCoord):
+            print(f"Coordinates already computed for dim={dims}. Exiting function.")
+            return None
+        
+        # For (dims not in self.scafManifoldDim) or (recompute), we need to compute the mapping as follows
         
         # Start by initializing MDS coordinates with the closed from eigendecomposition solution 
         D2 = self.scafDist**2
@@ -438,8 +473,15 @@ class mindModel:
         else:
             mdsCoord = mdsCoord - np.mean(mdsCoord)
             
-        if updateObject: self.scafManifold = mdsCoord # if requested, save coordinates 
-        if returnCoord: return mdsCoord # if requested, return output
+        if dims in self.scafManifoldDim:
+            dimidx = self.scafManifoldDim.index(dims)
+            self.scafManifold[dimidx] = mdsCoord
+        else:
+            self.scafManifold.append(mdsCoord)
+            self.scafManifoldDim.append(dims)
+        
+        if returnCoord:
+            return mdsCoord # if requested, return output
     
     # ---------------------------------------------
     # function library: forward and reverse mapping

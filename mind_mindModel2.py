@@ -4,6 +4,9 @@
 # Object Oriented Version
 # -- here, I'm porting the mindAlgorithm1_Freeze code towards an object oriented version --
 
+# Symmetric assignment version for dynamics
+# No more hyperplane assignments, just a (random forest of) landmark points with isotropic gaussian models (rather than causal dynamics). 
+
 # inclusions
 import numpy as np
 import numba as nb
@@ -120,15 +123,14 @@ class mindModel:
         sdata = self.drData[1:,:]
         
         # Use simple update switch because tqdm doesn't work on my laptop
-        if simpleUpdates: tstart = time.time()
+        if simpleUpdates: 
+            tstart = time.time()
+            eta = np.nan
             
         progressBar = tqdm(range(numTrees),disable=simpleUpdates)
         for tt in progressBar:
             if simpleUpdates: 
-                eta = (time.time() - tstart) * numTrees/(tt+1)
-                if tt==0: eta = np.nan
                 print(f"Fitting PPCA Tree {tt+1}/{numTrees}, eta: {eta:.1f} seconds...")
-                
             progressBar.set_description(f'Fitting PPCA Tree {tt+1}/{numTrees}')
             self.forest.append(self.splitForestNode(cdata,sdata))
             self.numTrees += 1
@@ -150,7 +152,26 @@ class mindModel:
             progressBar.set_description(f'Adding PPCA Tree {newTree+1}/{numTrees}')
             self.forest.append(self.splitForestNode(cdata,sdata))
             self.numTrees += 1
+    
+    def shallowTree(self, numScaffold):
+        l = np.zeros(numScaffold,dtype=int)
+        l[0] = np.random.choice(self.numObs,1,replace=False)
+        m = np.min(scipy.spatial.distance.cdist(self.drData[l[0],:],self.drData,metric='Euclidean'),axis=0)
+        for ii in range(1,self.numScaffold):
+            # Set next landmark to datapoint furthest from other datapoints
+            l[ii] = np.argmax(m)
+            m = np.minimum(m, np.sum((self.drData[l[ii],:] - self.drData)**2,axis=1))
+        scafIdx = l
+        scafData = self.drData[l,:]
+        for ns in numScaffold:
+            
+            # -- atl working point --
+            # need to find out how to get the closest scaffold point to all other data points...
+            d4scaf = np.sum((self.drData - scafData[ns,:])**2)
 
+                            
+                    
+        
     def splitForestNode(self, cdata, sdata, rootNode=True, ppcaModel=None):
         # recursive function to construct a decision tree
         # use hyperparameters to generate candidate split directions and thresholds
