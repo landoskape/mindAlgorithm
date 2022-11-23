@@ -94,7 +94,7 @@ class mindModel:
         self.mappingBackwardK = []
         self.mappingBackwardLambda = []
         self.mappingOptionsK = np.arange(2,21)
-        self.mappingOptionsLambda = np.logspace(-6,1,30)
+        self.mappingOptionsLambda = np.logspace(-6,1,8)
         self.mappingForwardOptDim = []
         self.mappingBackwardOptDim = []
         self.mappingForwardOptionsError = []
@@ -554,14 +554,8 @@ class mindModel:
                 # Otherwise, append to end of optimization values
                 replace = False
             
-            if len(self.scafManifold)>0 and (dim==self.scafManifold.shape[1]):
-                # If stored manfiold coordinates are same as requested dimension, use them
-                print(f"Using previously computed manifold coordinates that match current dimensionality...")
-                scafManifold = self.scafManifold
-            else:
-                # Otherwise, generate coordinates without saving
-                print(f"Generating manifold coordinates...")
-                scafManifold = self.performMDS(dim, updateObject=False, returnCoord=True, verbose=False)
+            # Retrieve scaffold manifold coordinates (use precomputed if available)
+            scafManifold = self.performMDS(dim, recompute=False, returnCoord=True, verbose=False)
             
             # Generate display variables for tracking progress...
             iterationBar = IntProgress(min=0, max=numIterations-1)
@@ -630,14 +624,8 @@ class mindModel:
                 # Otherwise, append to end of optimization values
                 replace = False
             
-            if len(self.scafManifold)>0 and (dim==self.scafManifold.shape[1]):
-                # If stored manfiold coordinates are same as requested dimension, use them
-                print(f"Using previously computed manifold coordinates that match current dimensionality...")
-                scafManifold = self.scafManifold
-            else:
-                # Otherwise, generate coordinates without saving
-                print(f"Generating manifold coordinates...")
-                scafManifold = self.performMDS(dim, updateObject=False, returnCoord=True, verbose=False)
+            # Retrieve scaffold manifold coordinates (use precomputed if available)
+            scafManifold = self.performMDS(dim, recompute=False, returnCoord=True, verbose=False)
             
             # Generate display variables for tracking progress...
             iterationBar = IntProgress(min=0, max=numIterations-1)
@@ -698,7 +686,7 @@ class mindModel:
     # -----------------------
     # -- forest processing --
     # -----------------------
-    def smartGridProbability(self, data):
+    def smartGridProbability(self, data, returnFull=False):
         # Compute probability of transition from each point in data to each point in data using PPCA models in forest
         # Automatically use log switch for computing probability due to numerical stability
         # Uses summarized tree structure 
@@ -719,9 +707,11 @@ class mindModel:
                 cexparg = np.sum((cudata @ tPpcaInvCov[n,:,:]) * cudata,axis=1)
                 cloglikelihood = -D/2*np.log(2*np.pi) - 1/2*tPpcaLogDet[n] - cexparg/2
                 probability[tt,n,:] = np.exp(cloglikelihood)
-        return np.median(probability,axis=0)
+        
+        if not returnFull: probability = np.median(probability,axis=0) # unless returning full array, take median across trees
+        return probability
 
-    def smartForestLikelihood(self, cdata, sdata):
+    def smartForestLikelihood(self, cdata, sdata, returnFull=False):
         # Compute probability of transition from all points in cdata to all points in sdata
         # both are NxD arrays of N observations and D dimensions, where D = self.drDims
         assert cdata.ndim==2, "cdata must be a matrix"
@@ -735,7 +725,9 @@ class mindModel:
             # For each tree, start by returning path index of each datapoint
             tPathIdx = self.returnPathIndexLoop(cdata, tt)
             probability[tt,:] = self.fastLikelihood(sdata, self.ppcaMeans[tt][tPathIdx,:], self.ppcaInvCovs[tt][tPathIdx,:,:], self.ppcaLogDets[tt][tPathIdx], D)
-        return np.median(probability,axis=0)
+        
+        if not returnFull: probability = np.median(probability,axis=0) # unless returning full array, take median across trees
+        return probability
 
     def fastLikelihood(self, data, u, iS, logDet, D): 
         udata = data - u
