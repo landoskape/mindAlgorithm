@@ -104,6 +104,8 @@ class mindModel:
         self.data = data
         self.numObs,self.numDims = data.shape
         if self.drActive:
+            # Use ppca to reduce dimensionality of dataset (to the number of dimensions required to explain 95% of activity)
+            print("Adding data: constructing PPCA model of full dataset.")
             self.drPPCA = mppca.ppcaModel(data, self.drMethod, self.drDimPrm)
             self.drData = (data - self.drPPCA.u) @ self.drPPCA.v
             self.drDims = self.drPPCA.q
@@ -380,7 +382,7 @@ class mindModel:
     # ----------------------
     # -- handle landmarks --
     # ----------------------
-    def constructScaffold(self):
+    def constructScaffoldPoints(self):
         # Greedy algorithm: http://graphics.stanford.edu/courses/cs468-05-winter/Papers/Landmarks/Silva_landmarks5.pdf
         l = np.zeros(self.numScafPoints,dtype=int)
         l[:self.numScafSeeds] = np.random.choice(self.numObs,self.numScafSeeds,replace=False)
@@ -391,7 +393,8 @@ class mindModel:
             m = np.minimum(m, np.sum((self.drData[l[ii],:] - self.drData)**2,axis=1))
         self.scafIdx = l
         self.scafData = self.drData[l,:]
-
+    
+    def measureScaffoldProbabilities(self):
         self.scafGridProb = self.smartGridProbability(self.scafData)
         self.scafTrProb = self.scafGridProb / np.sum(self.scafGridProb,axis=1).reshape(-1,1)
         assert np.allclose(np.sum(self.scafTrProb,axis=1),1), "sum(trProb,axis=1) does not all equal(close-to) 1!"
@@ -403,6 +406,14 @@ class mindModel:
         self.scafDist[sgdInfinite] = sgdMinimum[sgdInfinite] # If one side is infinite, use minimum transition distance
         assert np.all(self.scafDist >= 0), "Some of the scaffold distances are negative. This probably means that smartGridProbability() is broken."
         assert np.all(self.scafDist != np.inf), "Some of the scaffold distance are infinite. This means that Johnson's algorithm couldn't find a path between at least 1 pair of points in either direction. This sometimes happens when temporal resolution is too high, so datapoints are too close together in state space."
+        
+    def constructScaffold(self):
+        """
+        Convenience function for constructing scaffold points and measuring scaffold probabilities together
+        Note: scaffold points can be performed independent of the probability measurement, so if trees are added to the forest, you can run measureScaffoldProbabilities without updating the scaffold points (which takes a while). 
+        """
+        self.constructScaffoldPoints()
+        self.measureScaffoldProbabilies()
         
     # ------------------------------
     # -- multidimensional scaling --
