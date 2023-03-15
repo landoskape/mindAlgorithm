@@ -101,11 +101,14 @@ def ppcaValues(cdata, v, w, nv):
     assert v.shape[0]==D, "Eigenvectors must have same dimension as centered data"
     assert v.shape[1]==q, "Must have same number of eigenvectors and eigenvalues"
     assert nv <= np.min(w), "noise variance must be less than or equal to lowest eigenvalue (this is a sanity check, if thrown, something weird and unexpected happened"
-    
     cv = nv * np.identity(D) + (v @ (np.diag(w) - nv*np.identity(q)) @ v.T)
     icv = np.linalg.inv(cv)
     logDet = 2*np.log(np.prod(np.diag(np.linalg.cholesky(cv))))
+    if logDet>0.9999*np.finfo(cv.dtype).max:
+        # Log switch to handle large values
+        logDet = 2*np.sum(np.log(np.diag(np.linalg.cholesky(cv))))
     logLikelihood = -N*D/2*np.log(2*np.pi) - N/2*logDet - np.sum((cdata @ icv) * cdata)/2
+        
     return cv, icv, logDet, logLikelihood
     
 

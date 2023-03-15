@@ -1,9 +1,6 @@
 # code to implement the mind algorithm from the following paper:
 # paper: https://www.biorxiv.org/content/10.1101/418939v2.full.pdf
 
-# Object Oriented Version
-# -- here, I'm porting the mindAlgorithm1_Freeze code towards an object oriented version --
-
 # Symmetric assignment version for dynamics
 # No more hyperplane assignments, just a (random forest of) landmark points with isotropic gaussian models (rather than causal dynamics). 
 
