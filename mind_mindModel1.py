@@ -33,6 +33,7 @@ class mindModel:
         self.opts['nQuant'] = 8 # number of quantiles to choose threshold from
         self.opts['rf_method'] = 'minVariance' # which method to use for PPCA models in random forest (either 'minVariance' or 'numComponents')
         self.opts['rf_dimPrm'] = 0.95 # desired fraction of variance to explain with PPCA models (or number of components to keep)
+        self.opts['hpGreedy'] = False # Whether or not to use greedy algorithm to select hyperplane (use full PPCA or just isotropic for selecting hyperplane direction)
         # Options for landmark points
         self.opts['numScafPoints'] = 2000 # number of landmark points to create
         self.opts['numScafSeeds'] = 1 # number of landmark seeds to initiate algorithm with
@@ -63,6 +64,7 @@ class mindModel:
         self.nQuant = self.opts['nQuant']
         self.rf_method = self.opts['rf_method']
         self.rf_dimPrm = self.opts['rf_dimPrm']
+        self.hpGreedy = self.opts['hpGreedy']
         self.forest = []
         self.forestSummarized = False
         self.treeSummary = []
@@ -131,8 +133,12 @@ class mindModel:
                 if tt==0: eta = np.nan
                 print(f"Fitting PPCA Tree {tt+1}/{numTrees}, eta: {eta:.1f} seconds...")
                 
-            progressBar.set_description(f'Fitting PPCA Tree {tt+1}/{numTrees}')
-            self.forest.append(self.splitForestNode(cdata,sdata))
+            if self.hpGreedy:
+                progressBar.set_description(f'Fitting PPCA Tree {tt+1}/{numTrees} using greedy choice')
+                self.forest.append(self.splitForestNodeGreedy(cdata,sdata))
+            else:
+                progressBar.set_description(f'Fitting PPCA Tree {tt+1}/{numTrees} using full ppca models')
+                self.forest.append(self.splitForestNode(cdata,sdata))
             self.numTrees += 1
             if simpleUpdates and tt>0: eta=numTrees/(tt+1)*(time.time()-tstart)
             
@@ -149,8 +155,12 @@ class mindModel:
                 if newTree==0: eta = np.nan
                 print(f"Fitting PPCA Tree {newTree+1}/{numTrees}, eta: {eta:.1f} seconds...")
             
-            progressBar.set_description(f'Adding PPCA Tree {newTree+1}/{numTrees}')
-            self.forest.append(self.splitForestNode(cdata,sdata))
+            if self.hpGreedy:
+                progressBar.set_description(f'Adding PPCA Tree {newTree+1}/{numTrees} using greedy choice')
+                self.forest.append(self.splitForestNodeGreedy(cdata,sdata))
+            else:
+                progressBar.set_description(f'Adding PPCA Tree {newTree+1}/{numTrees} using full ppca models')
+                self.forest.append(self.splitForestNode(cdata,sdata))
             self.numTrees += 1
 
     def splitForestNode(self, cdata, sdata, rootNode=True, ppcaModel=None):
@@ -262,6 +272,110 @@ class mindModel:
         rightPPCA = rCandidatePPCA[idxHyperplane]
         
         return hpNormal, hpThreshold, leftPPCA, rightPPCA, cdata[idxLeft,:], sdata[idxLeft,:], cdata[idxRight,:], sdata[idxRight,:]
+    
+    def splitForestNodeGreedy(self, cdata, sdata, rootNode=True):
+        # recursive function to construct a decision tree
+        # use hyperparameters to generate candidate split directions and thresholds
+        # choose decision plane by optimizing likelihood (using a mean-identity approximation)
+        # construct left/right nodes and rerun splitForestNode on it
+        # path2node is a list of ints describing decision path towards this particular node
+        # --------- it starts as empty, and adds a 0 for every left choice and a 1 for every right choice
+        
+        # Define node dictionary to be returned
+        node = {}
+
+        # important variables for function
+        N = cdata.shape[0] # number of observations
+        D = self.drDims # number of dimensions of data
+        
+        if rootNode: assert N >= 2*self.nLeaf, "splitForestNode received a root node, but contains too few data points to split!"
+        if N < 2*self.opts['nLeaf']:
+            # If it has too few points to be split, it is a terminal node. 
+            # First, create a PPCA model for the data
+            ppcaModel = mppca.ppcaModel(sdata,self.rf_method,self.rf_dimPrm)
+            # Add PPCA model, identify as terminal node, then exit recursive function
+            node['terminalNode'] = True
+            node['ppca'] = ppcaModel
+            return node
+
+        # If this node is being split, find the best split direction
+        node['terminalNode'] = False
+        hpNormal, hpThreshold, ldata, lsdata, rdata, rsdata = self.optimizeHyperplaneGreedy(cdata, sdata)
+
+        # Add hyperplane to node dictionary
+        node['hpNormal'] = hpNormal
+        node['hpThreshold'] = hpThreshold
+        
+        # Return left and right leaves of node (recursively create tree, this function will call itself until it returns a terminal node)
+        node['left'] = self.splitForestNodeGreedy(ldata, lsdata, rootNode=False)
+        node['right'] = self.splitForestNodeGreedy(rdata, rsdata, rootNode=False)
+        return node
+
+    def optimizeHyperplaneGreedy(self, cdata, sdata):
+        # choosing a hyperplane to create a decision boundary
+        # we aim to model the successor states of our left and right leaf nodes with an isotropic gaussian (minimize squared error from mean)
+        # outputs hyperplane separating data (as a dictionary) and left/right current and successor data
+        assert cdata.ndim == 2, "cdata must be a matrix"
+        assert sdata.ndim == 2, "sdata must be a matrix"
+        assert cdata.shape == sdata.shape, "cdata and sdata must have same shape"
+        N = cdata.shape[0] # number of observations
+        D = self.drDims # number of dimensions
+        assert N >= 2*self.nLeaf, "optimizeHyperplane must receive data with at least 2*nLeaf!"
+
+        # Prepare splitting procedure (use quantile speedup trick for decision thresholds)
+        quantPoints = np.linspace(0,1,self.nQuant+2)[1:-1]
+        if (N < 4*self.nLeaf) and (0.5 not in quantPoints): 
+            # make sure we include the median when down to small datasets
+            quantPoints = np.concatenate((quantPoints,[0.5]))
+        
+        # Generate candidate hyperplane directions on unit hypersphere
+        hypDirs = np.zeros((self.nDir,D)) # do it this way to avoid annoyance, it's very much not the bottleneck of the pipeline 
+        while np.any(np.sum(hypDirs,axis=0) == 0): hypDirs = np.random.normal(0,1,(self.nDir,D))
+        hypDirs = hypDirs / np.sqrt(np.sum(hypDirs**2,axis=1)).reshape(-1,1)
+        assert np.allclose(np.linalg.norm(hypDirs,axis=1),1), "hypDirs don't all have norm==1!"
+
+        # Preallocate variables
+        hypThresholds = np.zeros(self.nDir)
+        lCandidatePPCA = []
+        rCandidatePPCA = []
+        ssErrorCandidate = np.zeros(self.nDir)
+        for ndir in range(self.nDir):
+            cProjection = cdata @ hypDirs[ndir,:]
+            cQuantiles = np.quantile(cProjection, quantPoints)
+            cssError = [] # sum of squared error for this direction (across all thresholds)
+            for cThreshold in cQuantiles:
+                # Do isotropic gaussian model first
+                idxLeft = np.where(cProjection <= cThreshold)[0]
+                idxRight = np.where(cProjection > cThreshold)[0]
+                # Instead of choosing quantiles intelligently, just skip this threshold if it produces too few datapoints in one of the children
+                if len(idxLeft)<self.nLeaf or len(idxRight)<self.nLeaf:
+                    cssError.append(np.inf)
+                    continue
+                cMeanLeft = np.mean(sdata[idxLeft,:],axis=0,keepdims=True)
+                cMeanRight = np.mean(sdata[idxRight,:],axis=0,keepdims=True)
+                cDevLeft = np.sum((sdata[idxLeft,:] - cMeanLeft)**2)
+                cDevRight = np.sum((sdata[idxRight,:] - cMeanRight)**2)
+                cssError.append(cDevLeft+cDevRight)
+            
+            # Then, for the best isotropic fit, compute a full ppca model
+            idxBestThreshold = np.argmin(cssError)
+            idxLeft = np.where(cProjection <= cQuantiles[idxBestThreshold])[0]
+            idxRight = np.where(cProjection > cQuantiles[idxBestThreshold])[0]
+
+            hypThresholds[ndir] = cQuantiles[idxBestThreshold]
+            ssErrorCandidate[ndir] = cssError[idxBestThreshold]
+            
+        # Find optimal direction, return indices for left and right data
+        idxHyperplane = np.argmin(ssErrorCandidate)
+        bestProjection = cdata @ hypDirs[idxHyperplane,:] # ATL I removed the transpose on cdata...
+        idxLeft = np.where(bestProjection <= hypThresholds[idxHyperplane])[0]
+        idxRight = np.where(bestProjection > hypThresholds[idxHyperplane])[0]
+
+        # Save optimal hyperplane values
+        hpNormal = hypDirs[idxHyperplane,:]
+        hpThreshold = hypThresholds[idxHyperplane]
+        
+        return hpNormal, hpThreshold, cdata[idxLeft,:], sdata[idxLeft,:], cdata[idxRight,:], sdata[idxRight,:]
     
     def checkContainsPPCA(self,node):
         # Take in (node) dictionary, check if it contains a valid PPCA model
@@ -413,7 +527,7 @@ class mindModel:
         Note: scaffold points can be performed independent of the probability measurement, so if trees are added to the forest, you can run measureScaffoldProbabilities without updating the scaffold points (which takes a while). 
         """
         self.constructScaffoldPoints()
-        self.measureScaffoldProbabilies()
+        self.measureScaffoldProbabilities()
         
     # ------------------------------
     # -- multidimensional scaling --

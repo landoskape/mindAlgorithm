@@ -22,6 +22,12 @@ class ppcaModel:
         self.v,self.w,self.nv,self.u,self.cv,self.icv,self.logDet,self.logLikelihood = ppcaFull(data, method, dimPrm, weights)
         self.q = len(self.w)
         self.exp = np.sum(self.w) / (np.sum(self.w) + self.nv*(data.shape[1]-self.q))
+        
+    def processData(self, data):
+        # take data and convert it to scores using the learned PPCA model
+        assert data.shape[1]==self.v.shape[0], "data must have same dimensions of PPCA model"
+        drData = (data - self.u) @ self.v
+        return drData
 
 def ppcaFull(data, method='minVariance', dimPrm=0.95, weights=None):
     v,w,nv,u = ppca(data, method, dimPrm, weights)

@@ -1,8 +1,9 @@
 # code to implement the mind algorithm from the following paper:
 # paper: https://www.biorxiv.org/content/10.1101/418939v2.full.pdf
 
-# Symmetric assignment version for dynamics
-# No more hyperplane assignments, just a (random forest of) landmark points with isotropic gaussian models (rather than causal dynamics). 
+# There are two major changes in this version:
+# 1. Symmetric assignment version for dynamics
+# 2. No more hyperplane assignments, just a (random forest of) landmark points with isotropic gaussian models (rather than causal dynamics). 
 
 # inclusions
 import numpy as np
